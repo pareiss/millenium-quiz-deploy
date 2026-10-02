@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Refuses plaintext secrets. Enable once per clone: git config core.hooksPath .githooks
+set -euo pipefail
+fail=0
+while IFS= read -r file; do
+  case "$file" in
+    overlays/*/secrets.env | overlays/*/postgres.env)
+      echo "pre-commit: $file is plaintext; run bin/secrets encrypt and commit secrets.enc.env" >&2
+      fail=1
+      ;;
+    *.enc.env)
+      if ! git show ":$file" | grep -q '^sops_version='; then
+        echo "pre-commit: $file is not SOPS-encrypted" >&2
+        fail=1
+      fi
+      ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACM)
+exit $fail

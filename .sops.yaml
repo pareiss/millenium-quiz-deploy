@@ -1,0 +1,6 @@
+# Secrets are encrypted with SOPS + age before they are committed.
+# Add a teammate or CI by appending their age public key (comma separated)
+# and running `bin/secrets updatekeys <overlay>`.
+creation_rules:
+  - path_regex: overlays/[^/]+/secrets\.enc\.env$
+    age: age1qpda8xx2jlcc97jc272xwant609smh5fn885mjm9gv7f3wt9sadswf07rn

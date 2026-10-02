@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: millennium-quiz
+data:
+  PORT: "4000"
+  POOL_SIZE: "10"
+  # Public URL used in resume links and the websocket origin check.
+  # Overridden per environment.
+  PHX_HOST: millennium-quiz.example.com
+  PHX_SCHEME: https
+  PHX_URL_PORT: "443"
+  # Prepared for clustering (see README "Scaling"); harmless with 1 replica.
+  DNS_CLUSTER_QUERY: millennium-quiz-headless.millennium-quiz.svc.cluster.local
+  ECTO_IPV6: "false"

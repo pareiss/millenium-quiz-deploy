@@ -1,0 +1,47 @@
+# Local k3s: plain http on http://millennium-quiz.localhost via Traefik.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: millennium-quiz
+
+resources:
+  - ../../base
+
+images:
+  # Image imported into k3s with `podman save … | sudo k3s ctr images import -`.
+  # Podman names local images "localhost/<name>"; with `docker build` use
+  # docker.io/library/millennium-quiz instead.
+  - name: millennium-quiz
+    newName: localhost/millennium-quiz
+    newTag: "0.1.0"
+
+# One gitignored env file feeds both secrets (copy secrets.env.example).
+secretGenerator:
+  - name: millennium-quiz
+    envs:
+      - secrets.env
+  - name: postgres
+    envs:
+      - secrets.env
+
+patches:
+  - target:
+      kind: ConfigMap
+      name: millennium-quiz
+    patch: |-
+      - op: replace
+        path: /data/PHX_HOST
+        value: millennium-quiz.localhost
+      - op: replace
+        path: /data/PHX_SCHEME
+        value: http
+      - op: replace
+        path: /data/PHX_URL_PORT
+        value: "80"
+  - target:
+      kind: Ingress
+      name: millennium-quiz
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: millennium-quiz.localhost

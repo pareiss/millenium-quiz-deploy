@@ -1,0 +1,3 @@
+# real secrets never go into git
+overlays/*/secrets.env
+overlays/*/postgres.env

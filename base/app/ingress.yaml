@@ -1,0 +1,18 @@
+# k3s ships Traefik as ingress controller; it proxies the LiveView
+# websocket (/live) without extra configuration.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: millennium-quiz
+spec:
+  rules:
+    - host: millennium-quiz.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: millennium-quiz
+                port:
+                  name: http

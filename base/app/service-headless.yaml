@@ -1,0 +1,15 @@
+# Resolves to all app pod IPs; used by dns_cluster to connect BEAM nodes
+# once the app runs with more than one replica.
+apiVersion: v1
+kind: Service
+metadata:
+  name: millennium-quiz-headless
+  labels:
+    app.kubernetes.io/name: millennium-quiz
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: millennium-quiz
+  ports:
+    - name: epmd
+      port: 4369

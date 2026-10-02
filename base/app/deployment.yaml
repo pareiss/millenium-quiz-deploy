@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: millennium-quiz
+  labels:
+    app.kubernetes.io/name: millennium-quiz
+spec:
+  # Game processes live in a node-local Registry: keep 1 replica until
+  # clustering + global registration is added (see app README).
+  replicas: 1
+  strategy:
+    # never two app versions at once for the same game processes
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: millennium-quiz
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: millennium-quiz
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534 # "nobody" in the image
+        runAsGroup: 65534
+      initContainers:
+        # Runs migrations and creates the first admin from ADMIN_USERNAME /
+        # ADMIN_PASSWORD if there is none. While Postgres is still starting it
+        # fails and is retried by Kubernetes, so it doubles as "wait for DB".
+        - name: migrate
+          image: millennium-quiz
+          command: ["/app/bin/migrate"]
+          envFrom:
+            - configMapRef:
+                name: millennium-quiz
+            - secretRef:
+                name: millennium-quiz
+      containers:
+        - name: app
+          image: millennium-quiz
+          ports:
+            - name: http
+              containerPort: 4000
+          envFrom:
+            - configMapRef:
+                name: millennium-quiz
+            - secretRef:
+                name: millennium-quiz
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # node name for distributed Erlang (used once clustering is enabled)
+            - name: RELEASE_NODE
+              value: "millennium_quiz@$(POD_IP)"
+            - name: RELEASE_DISTRIBUTION
+              value: name
+          startupProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
