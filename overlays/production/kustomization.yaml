@@ -1,0 +1,62 @@
+# Public deployment on k3s with a Let's Encrypt certificate from cert-manager
+# (see README "Public deployment with Let's Encrypt").
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: millennium-quiz
+
+resources:
+  - ../../base
+
+images:
+  # Replace with the image your CI pushes (README "Notes and next steps").
+  - name: millennium-quiz
+    newName: ghcr.io/pareiss/millennium-quiz
+    newTag: "0.1.0"
+
+secretGenerator:
+  - name: millennium-quiz
+    envs:
+      - secrets.env
+  - name: postgres
+    envs:
+      - secrets.env
+
+patches:
+  - target:
+      kind: ConfigMap
+      name: millennium-quiz
+    patch: |-
+      - op: replace
+        path: /data/PHX_HOST
+        value: quiz.example.com # <- your domain (also in the Ingress below)
+      # PHX_SCHEME https / PHX_URL_PORT 443 are the base defaults.
+      # Traefik is the one proxy in front of the app. Add 1 for every further
+      # proxy or load balancer in front of Traefik; the rate limits (login,
+      # e-mail, game creation) use this to find the client's address.
+      - op: add
+        path: /data/TRUSTED_PROXY_HOPS
+        value: "1"
+      # Postgres runs in the cluster, without TLS.
+      - op: add
+        path: /data/DATABASE_SSL
+        value: "false"
+  - target:
+      kind: Ingress
+      name: millennium-quiz
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: quiz.example.com # <- your domain
+      - op: add
+        path: /metadata/annotations
+        value:
+          # `letsencrypt-staging` first, then `letsencrypt-prod`
+          cert-manager.io/cluster-issuer: letsencrypt-staging
+      # cert-manager creates and renews this Secret
+      - op: add
+        path: /spec/tls
+        value:
+          - hosts:
+              - quiz.example.com # <- your domain
+            secretName: millennium-quiz-tls

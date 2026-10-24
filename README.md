@@ -16,6 +16,8 @@ base/                       environment-independent resources
   app/configmap.yaml        non-secret runtime config
   app/ingress.yaml          Traefik (k3s default)
 overlays/local/             local k3s: http://millennium-quiz.localhost
+overlays/production/        public host with a Let's Encrypt certificate (cert-manager)
+cluster/cert-manager/       Let's Encrypt ClusterIssuers (staging + prod), applied once
   kustomization.yaml        image tag, host, http URL, secret generation
   secrets.env.example       copy to secrets.env (gitignored)
 ```
@@ -53,6 +55,52 @@ Optionally, load the sample category:
 kubectl -n millennium-quiz exec deploy/millennium-quiz -- \
   bin/millennium_quiz eval 'MillenniumQuiz.Release.seed()'
 ```
+
+## Public deployment with Let's Encrypt
+
+[cert-manager](https://cert-manager.io) requests the certificate from Let's
+Encrypt and renews it; Traefik terminates TLS and the app runs plain http
+behind it. The app redirects http to https (it trusts `X-Forwarded-Proto`,
+which Traefik sets), sends HSTS and marks its session cookie `secure`, so no
+Traefik redirect middleware is needed.
+
+Prerequisites: a domain whose DNS record points at the cluster, and ports 80
+and 443 reachable from the internet (port 80 is needed for the HTTP-01
+challenge; otherwise use a DNS-01 solver in the issuer).
+
+```sh
+# 1. cert-manager, once per cluster (v1.21.3 was the latest on 2026-10-24;
+#    take the current one from https://github.com/cert-manager/cert-manager/releases)
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.3/cert-manager.yaml
+kubectl -n cert-manager rollout status deploy/cert-manager-webhook
+
+# 2. the issuers (edit the e-mail address first)
+kubectl apply -f cluster/cert-manager/clusterissuers.yaml
+
+# 3. the overlay: your domain in overlays/production/kustomization.yaml (3 places),
+#    fresh secrets, then deploy with the staging issuer
+cp overlays/production/secrets.env.example overlays/production/secrets.env   # fill in new values
+bin/secrets encrypt production
+kubectl apply -k overlays/production
+kubectl -n millennium-quiz get certificate,challenge,order   # Ready=True after a minute or two
+
+# 4. staging certificates are not trusted by browsers: once it works, change
+#    the annotation to `letsencrypt-prod` in the overlay and apply again
+#    (delete the secret `millennium-quiz-tls` so a real certificate is issued)
+kubectl -n millennium-quiz delete secret millennium-quiz-tls
+kubectl apply -k overlays/production
+```
+
+If the certificate stays pending, `kubectl -n millennium-quiz describe challenge`
+shows why (usually DNS not pointing at the cluster, or port 80 blocked).
+
+`TRUSTED_PROXY_HOPS` in the overlay is the number of proxies in front of the
+app (Traefik = 1). The app's rate limits take the client address from
+`X-Forwarded-For` with it; on k3s the address Traefik sees is the real one only
+if the load balancer service preserves the source IP
+(`externalTrafficPolicy: Local`), so check that the login limit counts you
+and not the node. Before going public, also go through the checklist
+"Before a public deployment" in the app's README.
 
 ## Day-to-day
 
@@ -109,7 +157,7 @@ database, change the password with `ALTER USER` first.
 
 - **Replicas:** the app runs with 1 replica and `Recreate`, because every running game is a process in a node-local Registry. Scaling out needs clustering (the headless service and `DNS_CLUSTER_QUERY` are already in place) plus `:global` or Horde registration in the app.
 - **Running games across deploys:** each game is snapshotted to Postgres after every move, so a restart only interrupts players for a few seconds.
-- **TLS:** the local overlay uses plain http. For a public overlay, set `PHX_SCHEME=https` / `PHX_URL_PORT=443`, add a cert-manager `Certificate` or Traefik ACME, and add an http→https redirect middleware.
+- **TLS:** the local overlay uses plain http; `overlays/production` gets its certificate from cert-manager (see "Public deployment with Let's Encrypt").
 - **Registry:** replace the `ctr import` step with CI pushing to GHCR, and point `images:` at `ghcr.io/<you>/millennium-quiz`.
 - **Backups:** the Postgres data lives on a k3s `local-path` volume on the node. Add a CronJob running `pg_dump` before relying on it.
 - **Yu-Gi-Oh! extras:** a card image cache (PVC or object storage) and an EDOPro/ygopro-core engine container would be added here as extra resources.
