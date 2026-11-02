@@ -181,3 +181,10 @@ again, or when a design decision should stop being questioned.
   script copies `secrets.env.example` in the review checkout. Generated Secret
   names and hash suffixes in `.review/rendered/` therefore differ from a real
   deploy; don't flag them.
+- **Fake credentials in `test/review/`.** The tests of the secret tripwire
+  contain deliberately fake values. `bin/review-tools` allowlists a hit only if
+  the file is under `test/review/`, the kind is age key, URL credentials or
+  assigned password/key, and the value is obviously fake (contains dummy, fake,
+  fixture or not-real; an age key of one repeated character). Those show up in
+  `checks.md` as "allowlisted fixture" lines. A real-looking value in
+  `test/review/`, or a fake-looking one anywhere else, is still a finding.

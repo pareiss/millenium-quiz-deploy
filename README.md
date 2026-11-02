@@ -187,7 +187,18 @@ go into "Decisions and known false positives" in `REVIEWING.md`.
 
 The reviewer is defined in `.claude/agents/pr-reviewer.md`. The scripts need
 `gh`, `claude`, `git`, `python3` and, for the manifest checks, `kubectl` or
-`kustomize`. The helper logic is tested without Claude or GitHub (the end-to-end
+`kustomize` and the Python module PyYAML (`pip install pyyaml` into the shared
+venv `/home/authority/sandbox/.venv`, which must then be first in `PATH`, or
+`sudo apt install python3-yaml` for the system python). Without PyYAML the
+kustomization path check fails closed: every overlay is refused and nothing is
+rendered; `bin/review-selfcheck` (run by `bin/review-deploy-pr`) stops with
+this hint. `bwrap` (bubblewrap) is recommended: kustomize then runs without
+network and with the home directory hidden. If bwrap is missing or does not
+work here (the render is probed with the exact command line it will use), the
+script falls back to `unshare` (network cut, filesystem NOT isolated) and, if
+that fails too, to no sandbox at all; `checks.md` states which one was used,
+and only the default load restrictor, no helm/plugins and the path check
+protect the render in the last case. The helper logic is tested without Claude or GitHub (the end-to-end
 test uses a fake `gh` and a fake `claude` in a temporary repository):
 
 ```sh

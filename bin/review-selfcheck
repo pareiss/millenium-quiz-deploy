@@ -24,6 +24,18 @@ cd "$root"
 source bin/review-flags
 reviews="$(bin/review-dir)"
 
+# The manifest checks of bin/review-deploy-pr (check-kustomizations) need PyYAML
+# and fail closed without it: every overlay would be refused, nothing rendered.
+if ! python3 -c 'import yaml' 2>/dev/null; then
+  cat >&2 <<MSG
+self-check failed: python3 ($(command -v python3)) has no PyYAML, which the manifest checks need.
+Without it every overlay is refused and the reviewer gets no rendered diff. Fix one of:
+  /home/authority/sandbox/.venv/bin/pip install pyyaml   (then run the scripts with that venv's bin first in PATH)
+  sudo apt install python3-yaml                          (system python)
+MSG
+  exit 1
+fi
+
 for flag in --restricted --strict-mcp-config --no-session-persistence --tools --allowedTools; do
   claude --help 2>&1 | grep -q -- "$flag" ||
     { echo "self-check failed: claude $(claude --version) has no $flag" >&2; exit 1; }

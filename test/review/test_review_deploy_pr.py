@@ -148,7 +148,7 @@ class ReviewDeployPrTest(unittest.TestCase):
         self.assertIn("- CI: none (this repository has no CI)", review)
 
     def test_secret_tripwire_and_unpinned_image_are_reported(self):
-        self.write("base/config.txt", "DB_PASSWORD: sup3rs3cretvalue\n")
+        self.write("base/config.txt", "DB_PASSWORD: dummy-fixture-value\n")
         self.write("overlays/local/kustomization.yaml", KUSTOMIZATION.format(tag="latest"))
         self.git("add", "-A")
         self.commit("oops")
@@ -156,8 +156,80 @@ class ReviewDeployPrTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         checks = self.material("checks.md")
         self.assertIn("base/config.txt: assigned password/secret/key", checks)
-        self.assertNotIn("sup3rs3cretvalue", checks)
+        self.assertNotIn("dummy-fixture-value", checks)
         self.assertIn("ghcr.io/o/app:latest: tag latest", checks)
+
+    def test_fixture_allowlist_is_reported_separately_and_real_secrets_still_flagged(self):
+        self.write("test/review/test_fx.py", "A = 'DB_PASSWORD: dummy-fixture-value'\nB = 'api_key: Xk9fQ2mZ7pLw'\n")
+        self.write("docs/note.md", "DB_PASSWORD: dummy-fixture-value\n")
+        self.git("add", "-A")
+        self.commit("fixtures")
+        done = self.review()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        checks = self.material("checks.md")
+        self.assertIn("- allowlisted fixture: test/review/test_fx.py: assigned password/secret/key", checks)
+        self.assertIn("Allowlisted fixtures", checks)
+        self.assertIn("- docs/note.md: assigned password/secret/key", checks)
+        self.assertIn("Possible credentials in added lines", checks)
+        # the real-looking value in the same test/review/ file is reported plainly
+        self.assertIn("\n- test/review/test_fx.py: assigned password/secret/key", checks)
+
+    def fake_bwrap(self):
+        # logs its arguments; accepts the flags of the real call and runs the rest
+        self.write_bin("bwrap", r"""#!/usr/bin/env bash
+echo "$*" >> "$FAKE_LOG/bwrap.log"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --unshare-all|--die-with-parent) shift ;;
+    --ro-bind) shift 3 ;;
+    --dev|--tmpfs) shift 2 ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+""")
+
+    def write_bin(self, name, body):
+        path = os.path.join(self.fakebin, name)
+        with open(path, "w") as f:
+            f.write(body)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+
+    def test_bwrap_probe_runs_the_same_arguments_as_the_real_call(self):
+        self.fake_bwrap()
+        self.write("overlays/local/kustomization.yaml", KUSTOMIZATION.format(tag="2.0"))
+        self.git("add", "-A")
+        self.commit("bump")
+        done = self.review()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        with open(os.path.join(self.log, "bwrap.log")) as f:
+            calls = f.read().splitlines()
+        probe, real = calls[0], calls[1:]
+        self.assertTrue(probe.endswith(" true"), probe)
+        prefix = probe[: -len(" true")]
+        self.assertIn("--unshare-all", prefix)
+        self.assertIn("--die-with-parent", prefix)
+        self.assertTrue(real)
+        self.assertTrue(all(c.startswith(prefix + " ") for c in real), (prefix, real))
+        self.assertIn("Sandbox: bwrap", self.material("checks.md"))
+
+    def test_failing_bwrap_probe_falls_back_instead_of_failing_every_build(self):
+        self.write_bin("bwrap", "#!/usr/bin/env bash\nexit 1\n")
+        done = self.review()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        checks = self.material("checks.md")
+        self.assertNotIn("Sandbox: bwrap", checks)
+        self.assertNotIn("BUILD FAILED", checks)
+
+    def test_selfcheck_tells_how_to_fix_missing_pyyaml(self):
+        real = shutil.which("python3")
+        self.write_bin("python3", f'#!/usr/bin/env bash\n[[ "$1 $2" == "-c import yaml" ]] && exit 1\nexec {real} "$@"\n')
+        env = dict(os.environ, PATH=self.fakebin + os.pathsep + os.environ["PATH"])
+        done = subprocess.run(["bin/review-selfcheck"], cwd=self.repo, env=env, capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no PyYAML", done.stderr)
+        self.assertIn("pip install pyyaml", done.stderr)
+        self.assertIn("python3-yaml", done.stderr)
 
     def test_build_failure_is_reported_not_fatal(self):
         self.write("overlays/local/kustomization.yaml", KUSTOMIZATION.replace("../../base", "../../nope").format(tag="1"))
@@ -345,23 +417,23 @@ class ReviewPostTest(unittest.TestCase):
         return subprocess.run(["bin/review-post", "7", *flags], cwd=self.repo, env=env, capture_output=True, text=True)
 
     def test_comment_with_a_credential_is_not_posted(self):
-        done = self.post("The config sets DB_PASSWORD: s3cr3tvalue99 in plain text.")
+        done = self.post("The config sets DB_PASSWORD: dummy-fixture-99 in plain text.")
         self.assertEqual(done.returncode, 1)
         self.assertIn("looks like it contains a credential", done.stderr)
         self.assertIn("assigned password/secret/key", done.stderr)
-        self.assertNotIn("s3cr3tvalue99", done.stderr + done.stdout)
+        self.assertNotIn("dummy-fixture-99", done.stderr + done.stdout)
         with open(os.path.join(self.log, "gh.log")) as f:
             self.assertNotIn("pr comment", f.read())
 
     def test_allow_secret_hits_posts_anyway_and_clean_comments_post(self):
-        done = self.post("The config sets DB_PASSWORD: s3cr3tvalue99 in plain text.", "--allow-secret-hits")
+        done = self.post("The config sets DB_PASSWORD: dummy-fixture-99 in plain text.", "--allow-secret-hits")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("posted:", done.stdout)
         done = self.post("Nothing sensitive here.")
         self.assertEqual(done.returncode, 0, done.stderr)
 
     def test_dry_run_warns_but_prints(self):
-        done = self.post("DB_PASSWORD: s3cr3tvalue99", "--dry-run")
+        done = self.post("DB_PASSWORD: dummy-fixture-99", "--dry-run")
         self.assertEqual(done.returncode, 0)
         self.assertIn("looks like it contains a credential", done.stderr)
 

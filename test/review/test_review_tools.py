@@ -225,8 +225,8 @@ class ReviewToolsTest(unittest.TestCase):
     def test_scan_secrets_flags_credentials_without_printing_them(self):
         diff = (
             "+++ b/base/app/configmap.yaml\n"
-            "+  DB_PASSWORD: s3cr3tvalue99\n"
-            "+  url: postgres://admin:hunter2hunter2@db/x\n"
+            "+  DB_PASSWORD: dummy-fixture-99\n"
+            "+  url: postgres://admin:dummy-hunter2-fixture@db/x\n"
             "+++ b/overlays/production/secrets.env\n"
             "+A=b\n"
             "+++ b/notes.md\n"
@@ -237,8 +237,35 @@ class ReviewToolsTest(unittest.TestCase):
         self.assertIn("base/app/configmap.yaml: registry/basic-auth credentials in a URL", out)
         self.assertIn("overlays/production/secrets.env: file name is one that holds plaintext credentials", out)
         self.assertIn("notes.md: age private key", out)
-        self.assertNotIn("s3cr3tvalue99", "\n".join(out))
+        self.assertNotIn("dummy-fixture-99", "\n".join(out))
         self.assertNotIn("hunter2", "\n".join(out))
+
+    def test_scan_secrets_allowlists_fake_fixtures_only_under_test_review(self):
+        age_fake = "AGE-SECRET-KEY-1" + "Q" * 58
+        age_real = "AGE-SECRET-KEY-1" + "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN"
+        diff = (
+            "+++ b/test/review/test_x.py\n"
+            f"+k = '{age_fake}'\n"
+            "+  DB_PASSWORD: dummy-fixture-99\n"
+            "+  url: postgres://admin:fake-pass-1234@db/x\n"
+        )
+        self.assertEqual(self.scan(diff), [
+            "allowlisted fixture: test/review/test_x.py: age private key",
+            "allowlisted fixture: test/review/test_x.py: assigned password/secret/key",
+            "allowlisted fixture: test/review/test_x.py: registry/basic-auth credentials in a URL",
+        ])
+        # a real-looking value in test/review/ is still reported
+        self.assertEqual(self.scan(f"+++ b/test/review/test_x.py\n+k = '{age_real}'\n"),
+                         ["test/review/test_x.py: age private key"])
+        self.assertEqual(self.scan("+++ b/test/review/test_x.py\n+  DB_PASSWORD: Xk9fQ2mZ7pLw\n"),
+                         ["test/review/test_x.py: assigned password/secret/key"])
+        self.assertEqual(self.scan("+++ b/test/review/test_x.py\n+t = 'ghp_" + "a1B2c3D4e5" * 4 + "'\n"),
+                         ["test/review/test_x.py: GitHub token"])
+        # the same fake values anywhere else are reported
+        for other in ("base/app.yaml", "test/other/test_x.py", "docs/test/review/x.md", "overlays/local/test/review.py"):
+            self.assertEqual(self.scan(f"+++ b/{other}\n+k = '{age_fake}'\n"), [f"{other}: age private key"])
+            self.assertEqual(self.scan(f"+++ b/{other}\n+  DB_PASSWORD: dummy-fixture-99\n"),
+                             [f"{other}: assigned password/secret/key"])
 
     def test_scan_secrets_accepts_placeholders_references_and_sops(self):
         diff = (
@@ -260,11 +287,11 @@ class ReviewToolsTest(unittest.TestCase):
     def test_scan_secrets_flags_commented_out_credentials(self):
         out = self.scan(
             "+++ b/overlays/x/postgres.txt\n"
-            "+# POSTGRES_PASSWORD=hunter2hunter2\n"
+            "+# POSTGRES_PASSWORD=dummy-hunter2-fixture\n"
             "+++ b/a.yaml\n"
             "+  # token: " + "A" * 50 + "\n"
             "+++ b/b.yaml\n"
-            "+  ## api_key: abcdefgh1234\n"
+            "+  ## api_key: dummy-abcdefgh1234\n"
         )
         self.assertEqual(out, [
             "overlays/x/postgres.txt: assigned password/secret/key",
@@ -279,8 +306,8 @@ class ReviewToolsTest(unittest.TestCase):
     def test_scan_secrets_placeholder_word_elsewhere_on_the_line_does_not_hide_a_secret(self):
         out = self.scan(
             "+++ b/a.yaml\n"
-            "+  url: postgres://admin:hunter2hunter2@db/x  # example\n"
-            "+  DB_PASSWORD: s3cr3tvalue99  # see the example in docs\n"
+            "+  url: postgres://admin:dummy-hunter2-fixture@db/x  # example\n"
+            "+  DB_PASSWORD: dummy-fixture-99  # see the example in docs\n"
         )
         self.assertEqual(out, [
             "a.yaml: registry/basic-auth credentials in a URL",
@@ -296,7 +323,7 @@ class ReviewToolsTest(unittest.TestCase):
         self.assertNotIn("eQ==", out)
 
     def test_scan_secrets_flags_api_key_but_not_key_names(self):
-        self.assertEqual(self.scan("+++ b/a.yaml\n+  api_key: abcdefgh1234\n"), ["a.yaml: assigned password/secret/key"])
+        self.assertEqual(self.scan("+++ b/a.yaml\n+  api_key: dummy-abcdefgh1234\n"), ["a.yaml: assigned password/secret/key"])
         self.assertEqual(self.scan("+++ b/a.yaml\n+  secretKeyRef:\n+  key: POSTGRES_PASSWORD\n"), [])
 
     def test_image_lint(self):

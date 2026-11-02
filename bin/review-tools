@@ -24,6 +24,7 @@
                                                   the checkout that reaches outside it (absolute or escaping ".." paths,
                                                   remote refs, helm charts) or that references a refused directory
 """
+import fnmatch
 import json
 import os
 import re
@@ -310,10 +311,38 @@ PLACEHOLDER = re.compile(r"(?i)change-?me|example|placeholder|<[^>]+>|\$\(|\$\{|
 PLAINTEXT_FILES = re.compile(r"(^|/)(secrets\.env|postgres\.env|keys\.txt|kubeconfig|[^/]*\.(pem|key)|id_(rsa|ed25519))$|(^|/)\.kube/config$")
 
 
+# Allowlist for the scanner's own test fixtures (test/review/ holds deliberately
+# fake credentials that would otherwise be reported on every review that touches
+# it). Narrow on purpose: a hit is allowlisted only if ALL hold:
+#   - the file is under FIXTURE_PATH_GLOB (fnmatch, "*" also crosses "/"),
+#   - its kind is in FIXTURE_KINDS,
+#   - the value is obviously fake: it contains FAKE_MARKER (dummy, fake, fixture,
+#     not-real), or it is an age key whose body is one repeated character.
+# Allowlisted hits are NOT dropped: they are printed as "allowlisted fixture: ..."
+# lines (bin/review-deploy-pr lists them separately in checks.md). Anything else,
+# including a real-looking secret in test/review/, is reported as before.
+FIXTURE_PATH_GLOB = "test/review/*"
+FIXTURE_KINDS = {"age private key", "registry/basic-auth credentials in a URL", "assigned password/secret/key"}
+FAKE_MARKER = re.compile(r"(?i)dummy|fake|fixture|not-?real")
+
+
+def obviously_fake(kind, value):
+    if kind == "age private key":
+        body = value[len("AGE-SECRET-KEY-1"):]
+        return len(set(body)) == 1
+    return bool(FAKE_MARKER.search(value))
+
+
+def is_allowlisted_fixture(path, kind, value):
+    return (fnmatch.fnmatchcase(path, FIXTURE_PATH_GLOB) and kind in FIXTURE_KINDS
+            and obviously_fake(kind, value))
+
+
 def scan_secrets(text=None):
     """Reads a unified diff on stdin; prints one line per suspicious addition.
     Prints nothing when clean. This is a cheap tripwire, not a scanner: the
-    reviewer still reads the diff."""
+    reviewer still reads the diff. Known fake test fixtures (see the allowlist
+    above) are printed as "allowlisted fixture: <path>: <kind>"."""
     text = sys.stdin.read() if text is None else text
     path, hits = "?", []
     for line in text.splitlines():
@@ -344,7 +373,10 @@ def scan_secrets(text=None):
                 continue
             if kind == "assigned password/secret/key" and m.group(1).lower().endswith(("name", "ref", "path", "file")):
                 continue
-            hits.append(f"{path}: {kind}")
+            if is_allowlisted_fixture(path, kind, value):
+                hits.append(f"allowlisted fixture: {path}: {kind}")
+            else:
+                hits.append(f"{path}: {kind}")
             break
     for h in dict.fromkeys(hits):
         print(h)

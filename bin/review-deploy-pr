@@ -224,11 +224,14 @@ kust_flags=(--load-restrictor=LoadRestrictionsRootOnly --enable-helm=false --ena
 if command -v kubectl >/dev/null; then kust=(kubectl kustomize)
 elif command -v kustomize >/dev/null; then kust=(kustomize build); fi
 kust_sandbox="none"
+# The ONE argument vector for bwrap: the probe below runs exactly this prefix
+# (with `true`), the real call runs it with kustomize appended, so a passing
+# probe means the real call can start.
+bwrap_prefix=(bwrap --unshare-all --die-with-parent --ro-bind / / --dev /dev --tmpfs "$HOME" --ro-bind "$wtroot" "$wtroot")
 if [[ ${#kust[@]} -gt 0 ]]; then
-  if command -v bwrap >/dev/null &&
-     bwrap --unshare-net --ro-bind / / --dev /dev --tmpfs "$HOME" --ro-bind "$wtroot" "$wtroot" true 2>/dev/null; then
+  if command -v bwrap >/dev/null && "${bwrap_prefix[@]}" true 2>/dev/null; then
     kust_sandbox="bwrap"
-    kust=(bwrap --unshare-all --die-with-parent --ro-bind / / --dev /dev --tmpfs "$HOME" --ro-bind "$wtroot" "$wtroot" "${kust[@]}")
+    kust=("${bwrap_prefix[@]}" "${kust[@]}")
   elif command -v unshare >/dev/null && unshare --map-root-user --net true 2>/dev/null; then
     kust_sandbox="unshare"
     kust=(unshare --map-root-user --net "${kust[@]}")
@@ -244,8 +247,15 @@ fi
   echo "## Secret tripwire on the added lines"
   echo
   leaks="$(git diff "$base" "$head" | bin/review-tools scan-secrets)"
+  fixtures="$(grep '^allowlisted fixture: ' <<<"$leaks" || true)"
+  leaks="$(grep -v '^allowlisted fixture: ' <<<"$leaks" || true)"
   if [[ -z "$leaks" ]]; then echo "No suspicious additions found (a cheap pattern check, not proof)."
   else echo "Possible credentials in added lines (values not shown; look at the diff):"; echo; sed 's/^/- /' <<<"$leaks"; fi
+  if [[ -n "$fixtures" ]]; then
+    echo
+    echo "Allowlisted fixtures (known fake values in test/review/, see FIXTURE_PATH_GLOB in bin/review-tools; still look at them in the diff, the allowlist does not cover real-looking values):"
+    echo; sed 's/^/- /' <<<"$fixtures"
+  fi
   echo
   echo "## Symlinks and .review/"
   echo
