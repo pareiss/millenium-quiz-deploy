@@ -14,8 +14,8 @@
 # never prints an empty, relative or "/reviews" path.
 #
 # Reviews that an older version left in this worktree's own reviews/ are not
-# moved. A notice on stderr names them and the cp+rm command; nothing is moved
-# or deleted. Other scripts call this via $(...), so the notice cannot be
+# moved. A notice on stderr names them and suggests commands that cannot lose data
+# (clashing files are listed for manual handling); nothing is moved or deleted. Other scripts call this via $(...), so the notice cannot be
 # suppressed for later calls: it appears once per call (or never, when
 # REVIEW_STRAY_NOTICED is set by the caller). stdout is only the path.
 #
@@ -48,13 +48,30 @@ reviews="$main/reviews"
 top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "${REVIEW_STRAY_NOTICED:-}" && -n "$top" && -d "$top/reviews" ]] &&
    [[ "$(cd "$top/reviews" && pwd -P)" != "$(cd "$reviews" 2>/dev/null && pwd -P || echo none)" ]]; then
-  files="$(find "$top/reviews" -type f | sort)"
-  if [[ -n "$files" ]]; then
+  # Paths relative to the stray reviews/, NUL-separated so any name is safe.
+  strays=(); clashes=(); movable=()
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"; strays+=("$rel")
+    if [[ -e "$reviews/$rel" || -L "$reviews/$rel" ]]; then clashes+=("$rel"); else movable+=("$rel"); fi
+  done < <(cd "$top/reviews" && find . -type f -print0 | sort -z)
+  if [[ ${#strays[@]} -gt 0 ]]; then
+    q() { printf '%q ' "$@"; }
     {
       echo "review-dir: reviews now live in $reviews, but this worktree still has:"
-      sed 's/^/  /' <<<"$files"
-      echo "These are not seen by the review scripts. To keep them, run:"
-      echo "  mkdir -p '$reviews' && cp -rn '$top/reviews/.' '$reviews/' && rm -r '$top/reviews'"
+      printf '  %s\n' "${strays[@]}"
+      echo "These are not seen by the review scripts. Nothing was moved or deleted."
+      echo "The commands below cannot lose data: a file that already exists in $reviews"
+      echo "is never overwritten or removed, and only an emptied directory is deleted."
+      if [[ ${#clashes[@]} -gt 0 ]]; then
+        echo "These files exist in both places; compare them and merge or delete by hand (the commands leave them alone):"
+        printf '  %s\n' "${clashes[@]}"
+      fi
+      if [[ ${#movable[@]} -gt 0 ]]; then
+        echo "To keep the others (copied with numbered backups, removed from here only after the copy succeeded):"
+        echo "  mkdir -p $(q "$reviews") && (cd $(q "$top/reviews") && cp -p --parents --backup=numbered -t $(q "$reviews") -- $(q "${movable[@]}") && rm -- $(q "${movable[@]}"))"
+      fi
+      echo "Then remove the directories that are empty now (files are never touched):"
+      echo "  find $(q "$top/reviews") -type d -empty -delete"
     } >&2
   fi
 fi

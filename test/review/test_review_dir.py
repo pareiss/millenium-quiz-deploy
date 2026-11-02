@@ -91,18 +91,82 @@ class ReviewDirTest(unittest.TestCase):
             # an empty reviews/ in the worktree is not worth a notice
             os.mkdir(os.path.join(wt, "reviews"))
             self.assertEqual(run_helper(wt).stderr, "")
-            open(os.path.join(wt, "reviews", "pr-old.md"), "w").close()
+            with open(os.path.join(wt, "reviews", "pr-old.md"), "w") as f:
+                f.write("old")
             r = run_helper(wt)
             self.assertEqual(r.returncode, 0)
             self.assertEqual(r.stdout, os.path.join(main, "reviews") + "\n")
-            self.assertIn(os.path.join(wt, "reviews", "pr-old.md"), r.stderr)
-            self.assertIn(
-                f"mkdir -p '{main}/reviews' && cp -rn '{wt}/reviews/.' '{main}/reviews/' && rm -r '{wt}/reviews'",
-                r.stderr)
+            self.assertIn("pr-old.md", r.stderr)
+            self.assertNotIn("cp -rn", r.stderr)
             # nothing was moved or deleted
             self.assertTrue(os.path.exists(os.path.join(wt, "reviews", "pr-old.md")))
             # a caller that already noticed can silence it
             self.assertEqual(run_helper(wt, REVIEW_STRAY_NOTICED="1").stderr, "")
+
+    def test_suggested_commands_never_lose_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            main, wt = make_repo(tmp)
+            mr, sr = os.path.join(main, "reviews"), os.path.join(wt, "reviews")
+
+            def put(base, rel, text):
+                path = os.path.join(base, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(text)
+
+            put(mr, "pr-clash.md", "main version")
+            put(mr, "archive/pr-x-1.md", "main archive")
+            put(sr, "pr-clash.md", "stray version")
+            put(sr, "pr-new one's.md", "new")
+            put(sr, "archive/pr-x-1.md", "stray archive")
+            put(sr, "archive/pr-y-2.md", "y")
+            put(sr, "logs/odd $name `x`.log", "log")
+            before = os.stat(os.path.join(mr, "pr-clash.md")).st_mtime
+            r = run_helper(wt)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            lines = r.stderr.splitlines()
+            self.assertIn("  pr-clash.md", lines)  # listed as clashing
+            self.assertIn("  archive/pr-x-1.md", lines)
+            cmds = [l.strip() for l in lines if l.startswith("  mkdir ") or l.startswith("  find ")]
+            self.assertEqual(len(cmds), 2, r.stderr)
+            for cmd in cmds:
+                done = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, done.stderr)
+
+            def read(base, rel):
+                with open(os.path.join(base, rel)) as f:
+                    return f.read()
+
+            # the clashing files were not touched in either place
+            self.assertEqual(read(mr, "pr-clash.md"), "main version")
+            self.assertEqual(read(sr, "pr-clash.md"), "stray version")
+            self.assertEqual(read(mr, "archive/pr-x-1.md"), "main archive")
+            self.assertEqual(read(sr, "archive/pr-x-1.md"), "stray archive")
+            self.assertEqual(os.stat(os.path.join(mr, "pr-clash.md")).st_mtime, before)
+            # the others arrived (odd names included) and left the stray directory
+            self.assertEqual(read(mr, "pr-new one's.md"), "new")
+            self.assertEqual(read(mr, "archive/pr-y-2.md"), "y")
+            self.assertEqual(read(mr, "logs/odd $name `x`.log"), "log")
+            self.assertFalse(os.path.exists(os.path.join(sr, "pr-new one's.md")))
+            self.assertFalse(os.path.exists(os.path.join(sr, "logs")))
+            # still there because it holds a clashing file
+            self.assertTrue(os.path.isdir(sr))
+
+    def test_emptied_stray_directory_is_removed_and_a_file_in_it_never(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            main, wt = make_repo(tmp)
+            os.makedirs(os.path.join(main, "reviews"))
+            os.makedirs(os.path.join(wt, "reviews", "sub"))
+            with open(os.path.join(wt, "reviews", "sub", "pr-a.md"), "w") as f:
+                f.write("a")
+            r = run_helper(wt)
+            for cmd in [l.strip() for l in r.stderr.splitlines() if l.startswith(("  mkdir ", "  find "))]:
+                subprocess.run(["bash", "-c", cmd], check=True, capture_output=True)
+            self.assertFalse(os.path.exists(os.path.join(wt, "reviews")))
+            with open(os.path.join(main, "reviews", "sub", "pr-a.md")) as f:
+                self.assertEqual(f.read(), "a")
 
 
 if __name__ == "__main__":
