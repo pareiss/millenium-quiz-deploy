@@ -19,6 +19,10 @@ which findings were rejected and why.
    commits after the review that address no finding, show them and ask the
    user whether to post anyway: the review's line numbers and evidence may be
    outdated. Only on yes, add `--confirm-unreviewed` to the next step.
+   **Credentials in the comment.** If the dry run warns that the comment looks
+   like it contains a credential, show the kinds it names (never the value),
+   have the review file edited, and run again. `--allow-secret-hits` only if
+   the user says it is a false positive.
 3. Ask for confirmation. On yes, run `bin/review-post $ARGUMENTS` (plus
    `--confirm-unreviewed` if confirmed in step 2) and report the comment's
    link. If the review was posted before, this updates that comment.

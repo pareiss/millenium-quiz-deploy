@@ -205,5 +205,83 @@ class ReviewDeployPrTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(wt, "reviews")))
 
 
+FAKE_GH_POST = r"""#!/usr/bin/env bash
+echo "$*" >> "$FAKE_LOG/gh.log"
+if [[ "$1 $2" == "pr view" && "$*" == *headRefName* ]]; then echo feature
+elif [[ "$1 $2" == "pr view" ]]; then echo '{"commits": []}'
+elif [[ "$1" == api ]]; then echo me
+elif [[ "$1 $2" == "pr comment" ]]; then echo http://x/pull/7#issuecomment-1
+fi
+"""
+
+REVIEW_FOR_POST = """# Review of PR #7: Test
+
+- PR: #7 http://x/pull/7
+- Branch: `feature`
+- Head: `{head}`
+
+## Summary
+Fine.
+
+## Findings
+
+### F1 · nit · a.txt:1 — Title
+- **Claim:** {claim}
+- **Evidence:** `a`
+- **Suggested fix:** None.
+- **Confidence:** low
+- **Your verdict:** [x] valid  [ ] wrong  [ ] unsure — reason: ok
+"""
+
+
+class ReviewPostTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = os.path.join(self.tmp.name, "repo")
+        self.log = os.path.join(self.tmp.name, "log")
+        self.fakebin = os.path.join(self.tmp.name, "fakebin")
+        for d in (self.repo, self.log, self.fakebin, os.path.join(self.repo, "bin")):
+            os.makedirs(d)
+        for name in ("review-dir", "review-post", "review-tools"):
+            shutil.copy(os.path.join(ROOT, "bin", name), os.path.join(self.repo, "bin", name))
+        gh = os.path.join(self.fakebin, "gh")
+        with open(gh, "w") as f:
+            f.write(FAKE_GH_POST)
+        os.chmod(gh, os.stat(gh).st_mode | stat.S_IEXEC)
+        sh("git", "init", "-q", "-b", "main", cwd=self.repo)
+        sh("git", "remote", "add", "origin", "git@github.com:me/deploy-repo.git", cwd=self.repo)
+        os.makedirs(os.path.join(self.repo, "reviews"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def post(self, claim, *flags):
+        with open(os.path.join(self.repo, "reviews", "pr-feature.md"), "w") as f:
+            f.write(REVIEW_FOR_POST.format(head="a" * 40, claim=claim))
+        env = dict(os.environ, PATH=self.fakebin + os.pathsep + os.environ["PATH"], FAKE_LOG=self.log)
+        return subprocess.run(["bin/review-post", "7", *flags], cwd=self.repo, env=env, capture_output=True, text=True)
+
+    def test_comment_with_a_credential_is_not_posted(self):
+        done = self.post("The config sets DB_PASSWORD: s3cr3tvalue99 in plain text.")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("looks like it contains a credential", done.stderr)
+        self.assertIn("assigned password/secret/key", done.stderr)
+        self.assertNotIn("s3cr3tvalue99", done.stderr + done.stdout)
+        with open(os.path.join(self.log, "gh.log")) as f:
+            self.assertNotIn("pr comment", f.read())
+
+    def test_allow_secret_hits_posts_anyway_and_clean_comments_post(self):
+        done = self.post("The config sets DB_PASSWORD: s3cr3tvalue99 in plain text.", "--allow-secret-hits")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("posted:", done.stdout)
+        done = self.post("Nothing sensitive here.")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_dry_run_warns_but_prints(self):
+        done = self.post("DB_PASSWORD: s3cr3tvalue99", "--dry-run")
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("looks like it contains a credential", done.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

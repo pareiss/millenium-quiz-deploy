@@ -4,7 +4,7 @@
 # and the commits after the review that address it (commits with a line like
 # "F2: ..." or "- F1, F5: ...").
 #
-#   bin/review-post <number> [review file] [--dry-run] [--confirm-unreviewed]
+#   bin/review-post <number> [review file] [--dry-run] [--confirm-unreviewed] [--allow-secret-hits]
 #
 # The review file defaults to the PR's current review, reviews/pr-<branch>.md,
 # or for a merged/closed PR its newest archived one.
@@ -13,19 +13,23 @@
 #   review never saw), it prints them and only posts with --confirm-unreviewed.
 # - Posting a review that was posted before updates that comment instead of
 #   adding a second one (the link is in the review's "- Posted:" line).
+# - The comment text goes through the secret tripwire (bin/review-tools
+#   scan-secrets) first; on a hit nothing is posted unless --allow-secret-hits.
 # - --dry-run prints the comment (and any warning) without posting.
 set -euo pipefail
 
-usage() { echo "usage: bin/review-post <number> [review file] [--dry-run] [--confirm-unreviewed]" >&2; exit 1; }
+usage() { echo "usage: bin/review-post <number> [review file] [--dry-run] [--confirm-unreviewed] [--allow-secret-hits]" >&2; exit 1; }
 
 number=""
 file=""
 dry_run=false
 confirm_unreviewed=false
+allow_secrets=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=true ;;
     --confirm-unreviewed) confirm_unreviewed=true ;;
+    --allow-secret-hits) allow_secrets=true ;;
     -*) usage ;;
     *)
       if [[ -z "$number" && "$arg" =~ ^[0-9]+$ ]]; then number="$arg"
@@ -64,6 +68,17 @@ trap 'rm -f "$commits" "$body"' EXIT
 gh pr view "$number" --json commits >"$commits"
 bin/review-tools post-body "$file" "$commits" "$(gh api user --jq .login)" >"$body"
 
+# The comment is public: a quoted credential must not go out with it. Values
+# are never printed, only the kind of hit.
+secret_hits="$({ echo "+++ b/the-comment"; sed 's/^/+/' "$body"; } | bin/review-tools scan-secrets)"
+if [[ -n "$secret_hits" ]]; then
+  {
+    echo "review-post: the comment text looks like it contains a credential:"
+    sed 's/^/  /' <<<"$secret_hits"
+    echo "Edit the review file ($file) to remove it."
+  } >&2
+fi
+
 unreviewed="$(bin/review-tools since-review "$file" "$commits")"
 if [[ -n "$unreviewed" ]]; then
   {
@@ -79,6 +94,11 @@ if [[ "$dry_run" == true ]]; then
   cat "$body"
   [[ -n "$previous" ]] && echo "(would update the comment posted before: issuecomment-$previous)" >&2
   exit 0
+fi
+
+if [[ -n "$secret_hits" && "$allow_secrets" != true ]]; then
+  echo "review-post: not posted; run again with --allow-secret-hits if this is a false positive" >&2
+  exit 1
 fi
 
 if [[ -n "$unreviewed" && "$confirm_unreviewed" != true ]]; then
