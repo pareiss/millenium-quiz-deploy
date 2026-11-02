@@ -79,10 +79,36 @@ without taking it over. Use a different host name than local's. The overlay
 changes everything that names the namespace (the Namespace itself,
 `DNS_CLUSTER_QUERY`); `DATABASE_URL` uses the short host `postgres`, which
 resolves in the pod's own namespace. Production and local share only the
-cluster-wide parts: cert-manager, the ClusterIssuers and Traefik. (If you
-earlier applied an older version of this overlay into `millennium-quiz`, it
-replaced local's Secrets and config there: re-apply `overlays/local` to restore
-them. Its Postgres volume keeps the password of its first start, see "Secrets".)
+cluster-wide parts: cert-manager, the ClusterIssuers and Traefik.
+
+#### If you applied an earlier version of this overlay
+
+An earlier version (commit a0bc33b) had no namespace of its own and was applied
+into `millennium-quiz`, where it replaced local's Secrets and config. Skip this
+if it was never applied. Otherwise (example commands for you to run, check
+the output of each first):
+
+```sh
+# what is left of it in the local namespace
+kubectl -n millennium-quiz get ingress,certificate,secret,order,challenge
+kubectl -n millennium-quiz get ingress millennium-quiz -o yaml | grep -A4 -i 'tls\|cert-manager'
+
+# restore local's own Secrets, config and Ingress (also drops the TLS block)
+kubectl apply -k overlays/local
+
+# delete only what cert-manager made for the old production host
+kubectl -n millennium-quiz delete certificate millennium-quiz-tls   # if listed
+kubectl -n millennium-quiz delete secret millennium-quiz-tls        # if listed
+```
+
+Do not delete the `postgres-0` pod, the volume `data-postgres-0` or the
+`postgres` / `millennium-quiz` Secrets of local (the re-apply replaces them
+with local's values; old generated ones with a different hash suffix are
+unused and may stay). The local Postgres volume keeps the password of its first
+start: if the old version started Postgres on a fresh volume with the
+production password, local's `secrets.env` no longer matches it, see "Secrets"
+(`ALTER USER`). Do not remove the cluster-wide ClusterIssuers or cert-manager;
+production uses them.
 
 ```sh
 # 1. cert-manager, once per cluster (v1.21.3 was the latest on 2026-10-24;
@@ -110,6 +136,11 @@ kubectl apply -k overlays/production
 
 If the certificate stays pending, `kubectl -n millennium-quiz-production describe challenge`
 shows why (usually DNS not pointing at the cluster, or port 80 blocked).
+
+Check the certificate later with
+`kubectl -n millennium-quiz-production get certificate,order,challenge` and
+`kubectl -n millennium-quiz-production describe certificate millennium-quiz-tls`
+(Ready=True, `Not After` date; cert-manager renews about 30 days before expiry).
 
 ### The image (before step 3)
 
@@ -172,9 +203,24 @@ kubectl -n kube-system get svc traefik -o jsonpath='{.spec.externalTrafficPolicy
 ```
 
 If it prints `Local`, the address is preserved. If it prints `Cluster` (or
-nothing), apply `cluster/traefik/helmchartconfig.yaml` once (it sets `Local`;
-k3s restarts Traefik, with a few seconds of downtime for every site behind it,
-local included) and check again. Then test the effect: make wrong logins at
+nothing), `cluster/traefik/helmchartconfig.yaml` sets `Local`. Applying it is an
+opt-in manual step and can overwrite an existing Traefik config: k3s reads one
+`HelmChartConfig` named `traefik` in `kube-system` and the file replaces its
+whole `valuesContent`. k3s may also ship its own
+`/var/lib/rancher/k3s/server/manifests/traefik-config.yaml` on the node, which
+it re-applies (edit that one instead if it exists). So look first:
+
+```sh
+kubectl -n kube-system get helmchartconfig traefik -o yaml
+# none found: preview, then apply
+kubectl diff -f cluster/traefik/helmchartconfig.yaml
+kubectl apply --server-side -f cluster/traefik/helmchartconfig.yaml
+# one exists: add `service.spec.externalTrafficPolicy: Local` to its
+# valuesContent by hand (kubectl -n kube-system edit helmchartconfig traefik)
+```
+
+k3s restarts Traefik (a few seconds of downtime for every site behind it, local
+included). Check the policy again afterwards. Then test the effect: make wrong logins at
 `/admin/login` with one user name from your own connection until the app
 answers with its rate-limit message (the limit per name and address is 5 in 5
 minutes), then try the same name from a different network (a phone on mobile
@@ -186,7 +232,96 @@ the overlay. With `Local`, the DNS record must point at the node that runs the
 Traefik pod (single node: no difference). Before going public, also go
 through the checklist "Before a public deployment" in the app's README.
 
-## Day-to-day
+## Production runbook
+
+All commands are examples for the owner to run; nothing here has been run
+against a cluster. Namespace `millennium-quiz-production`, database and user
+`millennium_quiz`. The production Postgres volume is the only copy of the data.
+
+**Back up first** (before every version bump, and regularly):
+
+```sh
+# 1. database dump to a local file (-Fc = compressed, restorable with pg_restore)
+kubectl -n millennium-quiz-production exec postgres-0 -- \
+  pg_dump -U millennium_quiz -Fc millennium_quiz > prod-$(date +%F).dump
+ls -l prod-*.dump   # not empty?
+
+# 2. the quiz content as JSON: /admin/backup "Download backup" in the browser
+#    (only the questions, not games or accounts), or:
+kubectl -n millennium-quiz-production exec deploy/millennium-quiz -c app -- \
+  bin/millennium_quiz eval 'MillenniumQuiz.Release.export_quiz("/tmp/quiz-backup.json")'
+kubectl -n millennium-quiz-production exec deploy/millennium-quiz -c app -- \
+  cat /tmp/quiz-backup.json > quiz-backup-$(date +%F).json
+```
+
+A backup you have not restored is not a backup: test the dump once in a
+throwaway database, never in the production one.
+
+```sh
+kubectl -n millennium-quiz-production exec -i postgres-0 -- createdb -U millennium_quiz restore_test
+kubectl -n millennium-quiz-production exec -i postgres-0 -- \
+  pg_restore -U millennium_quiz -d restore_test < prod-2026-11-02.dump
+kubectl -n millennium-quiz-production exec postgres-0 -- \
+  psql -U millennium_quiz restore_test -c 'select count(*) from schema_migrations'
+kubectl -n millennium-quiz-production exec postgres-0 -- dropdb -U millennium_quiz restore_test
+```
+
+Keep dumps outside the cluster (and out of git: they contain accounts). Lesson
+from the Gigalixir database that went read-only in October 2026: the only
+reason the quiz survived was an earlier `/admin/backup` file; take it first.
+
+**New version:**
+
+```sh
+# 1. backup (above). 2. find the new sha-<7> tag (app repo Actions -> Image, green)
+# 3. put it into newTag in overlays/production/kustomization.yaml, then
+kubectl kustomize overlays/production | grep 'image:'      # shows the new tag
+kubectl apply -k overlays/production
+kubectl -n millennium-quiz-production rollout status deploy/millennium-quiz
+kubectl -n millennium-quiz-production get pods
+kubectl -n millennium-quiz-production logs deploy/millennium-quiz -c migrate   # migrations ran?
+```
+
+The `migrate` init container runs the new version's migrations on every start,
+before the app. The Deployment uses `Recreate`: the old pod stops first, so
+expect a short outage.
+
+**Rollback:**
+
+```sh
+# 1. pin the previous sha tag in newTag and apply again (keeps git as the truth) ...
+kubectl apply -k overlays/production
+# 2. ... or, quicker, undo the last Deployment revision (then also put the old
+#    tag back in the overlay, or the next apply brings the new one back)
+kubectl -n millennium-quiz-production rollout undo deploy/millennium-quiz
+kubectl -n millennium-quiz-production rollout status deploy/millennium-quiz
+```
+
+Caveat: this only rolls back the code, not the database. If the new version
+ran a migration (see the `migrate` log), the old code runs against the
+migrated schema, which can fail or lose data if the migration is not
+backwards compatible. Then restore the pre-update dump: scale the app to 0
+(`kubectl -n millennium-quiz-production scale deploy/millennium-quiz --replicas=0`),
+drop and recreate the database or restore into it
+(`pg_restore --clean --if-exists -U millennium_quiz -d millennium_quiz < prod-<date>.dump`
+via `exec -i postgres-0`), set the old tag, apply (which scales back to 1).
+Games saved since the dump are lost.
+
+**Logs and status:**
+
+```sh
+kubectl -n millennium-quiz-production logs deploy/millennium-quiz -f           # app
+kubectl -n millennium-quiz-production logs deploy/millennium-quiz -c migrate   # migrations
+kubectl -n millennium-quiz-production logs postgres-0
+kubectl -n kube-system logs deploy/traefik                                     # requests, TLS
+kubectl -n millennium-quiz-production get pods,certificate
+kubectl -n millennium-quiz-production describe certificate millennium-quiz-tls
+```
+
+(The app logs to stdout; there are no log files. A restore's result from
+`/admin/backup` is also written to the app log.)
+
+## Day-to-day (local overlay)
 
 ```sh
 kubectl kustomize overlays/local          # render without applying (works offline)
