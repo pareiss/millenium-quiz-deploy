@@ -297,21 +297,24 @@ def scan_secrets(text=None):
         if not line.startswith("+") or line.startswith("+++"):
             continue
         added = line[1:]
-        if path.endswith(".enc.env") or added.lstrip().startswith("#"):
-            # SOPS-encrypted values are ENC[...]; a plaintext line in an .enc.env is checked below
-            if path.endswith(".enc.env") and not added.startswith(("sops_", "#")) and "ENC[" not in added and "=" in added:
+        if path.endswith(".enc.env"):
+            # SOPS-encrypted values are ENC[...]; a plaintext line in an .enc.env is flagged.
+            # Only here may comment lines be skipped.
+            if not added.startswith(("sops_", "#")) and "ENC[" not in added and "=" in added:
                 hits.append(f"{path}: line not encrypted by SOPS (no ENC[...])")
             continue
+        # A credential committed as a comment is still committed: scan the text after the "#".
+        added = re.sub(r"^\s*(#+\s*)+", "", added)
         for kind, rx in SECRET_LINE_PATTERNS:
             m = rx.search(added)
             if not m:
                 continue
-            value = m.group(m.lastindex) if m.lastindex else m.group(0)
-            if kind == "assigned password/secret/key" and (
-                PLACEHOLDER.search(value) or m.group(1).lower().endswith(("name", "ref", "path", "file"))
-            ):
+            value = m.group(2) if kind == "assigned password/secret/key" else m.group(0)
+            # Placeholders are judged on the matched value only, so a real secret
+            # on a line that also says "example" is still reported.
+            if PLACEHOLDER.search(value):
                 continue
-            if kind != "assigned password/secret/key" and PLACEHOLDER.search(added):
+            if kind == "assigned password/secret/key" and m.group(1).lower().endswith(("name", "ref", "path", "file")):
                 continue
             hits.append(f"{path}: {kind}")
             break

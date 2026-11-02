@@ -209,6 +209,36 @@ class ReviewToolsTest(unittest.TestCase):
         out = self.scan("+++ b/overlays/x/secrets.enc.env\n+POSTGRES_PASSWORD=plain\n")
         self.assertEqual(out, ["overlays/x/secrets.enc.env: line not encrypted by SOPS (no ENC[...])"])
 
+    def test_scan_secrets_flags_commented_out_credentials(self):
+        out = self.scan(
+            "+++ b/overlays/x/postgres.txt\n"
+            "+# POSTGRES_PASSWORD=hunter2hunter2\n"
+            "+++ b/a.yaml\n"
+            "+  # token: " + "A" * 50 + "\n"
+            "+++ b/b.yaml\n"
+            "+  ## api_key: abcdefgh1234\n"
+        )
+        self.assertEqual(out, [
+            "overlays/x/postgres.txt: assigned password/secret/key",
+            "a.yaml: base64 .dockerconfigjson / kubeconfig token",
+            "b.yaml: assigned password/secret/key",
+        ])
+        self.assertEqual(self.scan("+++ b/a.yaml\n+# a plain comment about passwords\n+# DB_PASSWORD: change-me-now\n"), [])
+
+    def test_scan_secrets_comments_are_skipped_only_in_enc_env(self):
+        self.assertEqual(self.scan("+++ b/overlays/x/secrets.enc.env\n+# POSTGRES_PASSWORD=plain\n"), [])
+
+    def test_scan_secrets_placeholder_word_elsewhere_on_the_line_does_not_hide_a_secret(self):
+        out = self.scan(
+            "+++ b/a.yaml\n"
+            "+  url: postgres://admin:hunter2hunter2@db/x  # example\n"
+            "+  DB_PASSWORD: s3cr3tvalue99  # see the example in docs\n"
+        )
+        self.assertEqual(out, [
+            "a.yaml: registry/basic-auth credentials in a URL",
+            "a.yaml: assigned password/secret/key",
+        ])
+
     def test_strip_secrets_drops_secret_documents_only(self):
         rendered = "kind: ConfigMap\nmetadata:\n  name: a\n---\nkind: Secret\ndata:\n  X: eQ==\n---\nkind: Service\n"
         out = self.run_tool(tools.strip_secrets, rendered)
