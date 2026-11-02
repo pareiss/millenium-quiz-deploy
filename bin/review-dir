@@ -1,14 +1,62 @@
 #!/usr/bin/env bash
 # Prints the absolute path of the reviews directory: <main checkout>/reviews.
 #
-# The main checkout is the parent of the repository's common git directory, so
-# the answer is the same from the main checkout and from any of its worktrees.
-# Reviews therefore never end up inside a worktree, where they would vanish
-# with it. Every script and skill that reads or writes reviews/ asks this one
-# command (reviews/archive/ and reviews/logs/ live under it).
+# The main checkout is the parent of the repository's common git directory when
+# that is named .git, so the answer is the same from the main checkout and from
+# any of its worktrees. Reviews therefore never end up inside a worktree, where
+# they would vanish with it. Every script and skill that reads or writes
+# reviews/ asks this one command (reviews/archive/ and reviews/logs/ live under
+# it).
+#
+# With a separate git dir or a submodule the main checkout is only known from
+# its own working tree (--show-toplevel). From a linked worktree of such a
+# repository, and in a bare repository, the command fails with a message; it
+# never prints an empty, relative or "/reviews" path.
+#
+# Reviews that an older version left in this worktree's own reviews/ are not
+# moved. A notice on stderr names them and the cp+rm command; nothing is moved
+# or deleted. Other scripts call this via $(...), so the notice cannot be
+# suppressed for later calls: it appears once per call (or never, when
+# REVIEW_STRAY_NOTICED is set by the caller). stdout is only the path.
 #
 #   bin/review-dir            # e.g. /home/me/millennium-quiz-deploy/reviews
 set -euo pipefail
 
-common="$(git rev-parse --path-format=absolute --git-common-dir)"
-printf '%s/reviews\n' "$(dirname "$common")"
+fail() { echo "review-dir: $*" >&2; exit 1; }
+
+[[ "$(git rev-parse --is-bare-repository 2>/dev/null)" != true ]] ||
+  fail "bare repository; there is no main checkout to keep reviews/ in"
+common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+  fail "not inside a git repository (or git failed)"
+gitdir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)" ||
+  fail "git failed to find the git dir"
+
+if [[ "$(basename "$common")" == .git ]]; then
+  main="$(dirname "$common")"
+elif [[ "$gitdir" == "$common" ]]; then
+  # Separate git dir or submodule, run from its own working tree.
+  main="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "git failed to find the top level"
+else
+  fail "cannot find the main checkout from this linked worktree (git dir $common is not <checkout>/.git); run the command from the main checkout"
+fi
+if [[ -z "$main" || "$main" != /* || "$main" == / ]]; then
+  fail "cannot determine the main checkout (got '${main}')"
+fi
+reviews="$main/reviews"
+
+# Stray reviews/ in this worktree (left by an older version): notice only.
+top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "${REVIEW_STRAY_NOTICED:-}" && -n "$top" && -d "$top/reviews" ]] &&
+   [[ "$(cd "$top/reviews" && pwd -P)" != "$(cd "$reviews" 2>/dev/null && pwd -P || echo none)" ]]; then
+  files="$(find "$top/reviews" -type f | sort)"
+  if [[ -n "$files" ]]; then
+    {
+      echo "review-dir: reviews now live in $reviews, but this worktree still has:"
+      sed 's/^/  /' <<<"$files"
+      echo "These are not seen by the review scripts. To keep them, run:"
+      echo "  mkdir -p '$reviews' && cp -rn '$top/reviews/.' '$reviews/' && rm -r '$top/reviews'"
+    } >&2
+  fi
+fi
+
+printf '%s\n' "$reviews"
