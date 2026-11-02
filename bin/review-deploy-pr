@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# Reviews one pull request of this deploy repository in a separate, isolated
+# Claude Code process. (Deliberately not called review-pr: the quiz repo has
+# its own bin/review-pr, and the two must never be mixed up.)
+#
+#   bin/review-deploy-pr <number> [--force]
+#
+# The reviewer's instructions and model come from .claude/agents/pr-reviewer.md.
+# It runs inside a throwaway worktree of the PR's head commit with the flags in
+# bin/review-flags: only Read, Grep and Glob (no shell, no Write/Edit, no MCP),
+# confined to that worktree, no settings, no saved session. bin/review-selfcheck
+# verifies that this isolation holds with the installed Claude Code. As
+# --restricted skips project agents, the instructions are passed with
+# --append-system-prompt.
+#
+# The reviewer must be a different model family than the one that wrote the PR
+# (from the commits' "Co-Authored-By: Claude <model>" trailers); this is checked
+# before the run and again against the model that actually answered.
+#
+# `gh` only ever talks to this repository: GH_REPO is taken from the origin
+# remote (bin/review-tools repo). Nothing is applied to a cluster, and no
+# kubectl command that needs a cluster is run.
+#
+# Everything the reviewer needs is prepared as files in <worktree>/.review/:
+# the diff (with head line numbers) and commits against the merge base, the PR
+# description, REVIEWING.md from this checkout, tests.md (this repo has no CI,
+# and it says so) and checks.md: the OFFLINE checks this script runs itself,
+# before the reviewer starts, so the reviewer needs no shell: a secret
+# tripwire over the added lines, `kubectl kustomize` of base and every overlay
+# (placeholder secrets from the committed *.example files; Secret documents
+# are dropped from the output), the rendered manifests of head and their diff
+# against the merge base (.review/rendered/), unpinned images, and kubeconform
+# if it is installed. Afterwards every cited path:line is checked against the
+# head commit.
+#
+# Output: reviews/pr-<branch>.md, one current review per PR (the branch name
+# with characters other than letters, digits, ".", "_" and "-" replaced by "-").
+# A new review moves the previous one, with its verdicts, to reviews/archive/.
+# Exit codes: 0 reviewed, 3 skipped (the current review is of this commit), 1 failed.
+# Environment: REVIEW_MODEL (default: the model in the agent file),
+# REVIEW_SELFCHECKED=1 to skip the self-check (bin/review-deploy-open-prs runs it once),
+# REVIEW_CLEANED=1 to skip archiving reviews of merged/closed PRs (likewise).
+set -euo pipefail
+
+usage() { echo "usage: bin/review-deploy-pr <number> [--force]" >&2; exit 1; }
+
+number=""
+force=false
+for arg in "$@"; do
+  case "$arg" in
+    --force) force=true ;;
+    [0-9]*) number="$arg" ;;
+    *) usage ;;
+  esac
+done
+[[ -n "$number" ]] || usage
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+# gh may only talk to this repository, whatever the environment or cwd says.
+GH_REPO="$(bin/review-tools repo)"
+export GH_REPO
+# shellcheck source=bin/review-flags
+source bin/review-flags
+
+agent=".claude/agents/pr-reviewer.md"
+[[ -f "$agent" ]] || { echo "review-deploy-pr: $agent not found" >&2; exit 1; }
+# Body = everything after the closing "---" of the frontmatter.
+instructions="$(awk 'f>=2 {print} /^---$/ {f++}' "$agent")"
+model="${REVIEW_MODEL:-$(sed -n 's/^model: *//p' "$agent" | head -1)}"
+model="${model:-sonnet}"
+
+for tool in gh claude git python3; do
+  command -v "$tool" >/dev/null || { echo "review-deploy-pr: $tool not found" >&2; exit 1; }
+done
+
+pr=$(gh pr view "$number" --json number,title,headRefOid,baseRefOid,baseRefName,headRefName,isDraft,url \
+  --jq '[.headRefOid, .baseRefOid, .baseRefName, .headRefName, (.isDraft|tostring), .url, .title] | join("\t")') ||
+  { echo "review-deploy-pr: PR #$number not found" >&2; exit 1; }
+IFS=$'\t' read -r head base_tip base_branch branch draft url title <<<"$pr"
+
+short="${head:0:7}"
+slug="$(printf '%s' "$branch" | sed 's/[^A-Za-z0-9._-]/-/g')"
+mkdir -p reviews
+out="reviews/pr-${slug}.md"
+reviewed_head() { sed -n 's/^- Head: `\([0-9a-f]*\)`.*/\1/p' "$1" | head -1; }
+
+if [[ -e "$out" && "$force" != true && "$(reviewed_head "$out")" == "$head" ]]; then
+  echo "skipped: PR #$number at $short already reviewed ($out); use --force to review again"
+  exit 3
+fi
+
+# Make sure both commits are here (the PR may come from a branch we never fetched).
+if ! git cat-file -e "${head}^{commit}" 2>/dev/null || ! git cat-file -e "${base_tip}^{commit}" 2>/dev/null; then
+  git fetch --quiet origin "+refs/pull/${number}/head:refs/remotes/origin/pr/${number}" "$base_branch"
+fi
+
+# The base branch may have moved on since the PR branched off; diffing against
+# its tip would show those newer commits as reversed changes of the PR.
+base="$(git merge-base "$base_tip" "$head")"
+
+# The reviewer must not share the author's blind spots: refuse a model of the
+# same family as any Claude model that co-authored the PR's commits.
+authors="$(bin/review-tools authors "$base" "$head")"
+reviewer_family="$(bin/review-tools family "$model")"
+if [[ " $authors " == *" $reviewer_family "* ]]; then
+  echo "review-deploy-pr: PR #$number was written with Claude ${authors// /, }; the reviewer must be another model than $model (e.g. REVIEW_MODEL=$( [[ $reviewer_family == sonnet ]] && echo fable || echo sonnet))" >&2
+  exit 1
+fi
+
+# Reviews of PRs that are merged or closed don't belong in reviews/ anymore.
+if [[ "${REVIEW_CLEANED:-}" != 1 ]]; then
+  bin/review-cleanup
+fi
+
+if [[ "${REVIEW_SELFCHECKED:-}" != 1 ]]; then
+  bin/review-selfcheck || { echo "review-deploy-pr: reviewer isolation not verified, not reviewing" >&2; exit 1; }
+fi
+
+worktree="$root/.claude/worktrees/pr-${slug}-$$"
+base_worktree="$root/.claude/worktrees/prbase-${slug}-$$"
+tmp="$(mktemp)"
+run="$(mktemp)"
+cleanup() {
+  git worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  git worktree remove --force "$base_worktree" >/dev/null 2>&1 || true
+  rm -f "$tmp" "$run"
+}
+trap cleanup EXIT
+
+git worktree add --quiet --detach "$worktree" "$head"
+
+# The review material, so the reviewer needs no shell or network.
+material="$worktree/.review"
+mkdir -p "$material"
+cp REVIEWING.md "$material/REVIEWING.md"
+git log --reverse --format='%h %s%n%n%b' "$base..$head" >"$material/commits.txt"
+git diff --stat "$base" "$head" >"$material/files.txt"
+git diff "$base" "$head" | bin/review-tools annotate-diff >"$material/diff.patch"
+gh pr view "$number" --json title,body --jq '"# " + .title + "\n\n" + .body' >"$material/description.md"
+
+# This repository has no CI, so there are no test results to hand over. What
+# can be checked offline is checked here, BEFORE the reviewer starts, so the
+# reviewer needs no shell: .review/checks.md (secret tripwire, kustomize
+# build of base and every overlay, image pins, kubeconform if installed) and
+# .review/rendered/ (the rendered manifests of head and the diff against base).
+if [[ -n "$(git ls-tree -r --name-only "$head" .github/workflows 2>/dev/null)" ]]; then
+  ci_status="workflows exist but bin/review-deploy-pr does not read their results"
+  echo "The head commit has .github/workflows, but this script does not download CI results. Treat the tests as not run; see checks.md for what the script ran itself." >"$material/tests.md"
+else
+  ci_status="none (this repository has no CI)"
+  { echo "This repository has no CI: no workflow ran for the head commit, so there are no"
+    echo "test results. Nothing was applied to a cluster. The only automatic checks are the"
+    echo "offline ones the script ran before you started; read .review/checks.md."; } >"$material/tests.md"
+fi
+
+# Render with throwaway worktrees only: overlays read a gitignored secrets.env,
+# which is not in a checkout, so the committed *.example is copied in as a
+# stand-in (placeholder values; real secrets are never read). Rendered Secret
+# documents are dropped anyway.
+render_all() { # <worktree> <outdir>: writes <outdir>/<overlay>.yaml or .error
+  local wt="$1" out="$2" dir name
+  mkdir -p "$out"
+  for dir in "$wt"/base "$wt"/overlays/*/; do
+    [[ -f "$dir/kustomization.yaml" ]] || continue
+    dir="${dir%/}"; name="$(basename "$dir")"
+    if [[ -f "$dir/secrets.env.example" && ! -f "$dir/secrets.env" ]]; then
+      cp "$dir/secrets.env.example" "$dir/secrets.env"
+    fi
+    if "${kust[@]}" "$dir" >"$out/$name.raw" 2>"$out/$name.error"; then
+      bin/review-tools strip-secrets <"$out/$name.raw" >"$out/$name.yaml"
+      rm -f "$out/$name.error"
+    else
+      rm -f "$out/$name.yaml"
+    fi
+    rm -f "$out/$name.raw"
+  done
+  rm -f "$wt"/overlays/*/secrets.env # the placeholder copies must not stay in the reviewer's checkout
+}
+
+kust=()
+if command -v kubectl >/dev/null; then kust=(kubectl kustomize)
+elif command -v kustomize >/dev/null; then kust=(kustomize build); fi
+
+{
+  echo "# Offline checks run by bin/review-deploy-pr before the review"
+  echo
+  echo "Nothing here touched a cluster. Placeholder values stand in for secrets."
+  echo
+  echo "## Secret tripwire on the added lines"
+  echo
+  leaks="$(git diff "$base" "$head" | bin/review-tools scan-secrets)"
+  if [[ -z "$leaks" ]]; then echo "No suspicious additions found (a cheap pattern check, not proof)."
+  else echo "Possible credentials in added lines (values not shown; look at the diff):"; echo; sed 's/^/- /' <<<"$leaks"; fi
+  echo
+  echo "## kustomize build"
+  echo
+  if [[ ${#kust[@]} -eq 0 ]]; then
+    echo "Not run: neither kubectl nor kustomize is installed."
+  else
+    render_all "$worktree" "$material/rendered/head"
+    git worktree add --quiet --detach "$base_worktree" "$base"
+    render_all "$base_worktree" "$material/rendered/base"
+    for f in "$material"/rendered/head/*.yaml "$material"/rendered/head/*.error; do
+      [[ -e "$f" ]] || continue
+      name="$(basename "$f")"; name="${name%.*}"
+      if [[ "$f" == *.error ]]; then
+        echo "- \`$name\`: BUILD FAILED"; sed 's/^/    /' "$f" | head -20
+      else
+        echo "- \`$name\`: builds ($(grep -c '^kind:' "$f") resources) -> .review/rendered/head/$name.yaml"
+        if [[ -f "$material/rendered/base/$name.yaml" ]]; then
+          if diff -u --label "base/$name.yaml (merge base)" --label "head/$name.yaml" "$material/rendered/base/$name.yaml" "$f" >"$material/rendered/diff-$name.patch"; then
+            rm -f "$material/rendered/diff-$name.patch"; echo "    rendered output unchanged vs. the merge base"
+          else
+            echo "    rendered output CHANGED vs. the merge base -> .review/rendered/diff-$name.patch"
+          fi
+        else
+          echo "    new or not buildable at the merge base"
+        fi
+      fi
+    done
+    echo
+    echo "## Images in the rendered overlays that are not pinned (base is skipped: overlays set its image)"
+    echo
+    unpinned="$(find "$material/rendered/head" -name "*.yaml" ! -name base.yaml -exec cat {} + 2>/dev/null | bin/review-tools image-lint | sort -u)"
+    if [[ -z "$unpinned" ]]; then echo "None (every image has a tag or digest, none is \`latest\`)."
+    else sed 's/^/- /' <<<"$unpinned"; fi
+  fi
+  echo
+  echo "## kubeconform"
+  echo
+  if command -v kubeconform >/dev/null && ls "$material"/rendered/head/*.yaml >/dev/null 2>&1; then
+    for f in "$material"/rendered/head/*.yaml; do
+      echo "- \`$(basename "$f")\`: $(kubeconform -summary -ignore-missing-schemas "$f" 2>&1 | tail -1)"
+    done
+  else
+    echo "Not run (kubeconform is not installed, or nothing was rendered)."
+  fi
+  echo
+  echo "Files under cluster/ are plain manifests, not a kustomization; they are not rendered, only read."
+} >"$material/checks.md"
+rm -f "$material"/rendered/*/*.error 2>/dev/null || true
+
+prompt="Review pull request #${number} (branch ${branch} into ${base_branch}).
+Base commit (merge base): ${base}
+Head commit: ${head}
+The working directory is a read-only checkout of the head commit; the review
+material is in .review/. Follow your review procedure and output only the review."
+
+echo "reviewing PR #$number ($short) with $model…"
+if ! (cd "$worktree" && claude -p "$prompt" \
+  --append-system-prompt "$instructions" \
+  --model "$model" \
+  "${review_flags[@]}" \
+  --output-format json </dev/null >"$run") ||
+  ! used="$(bin/review-tools run-result "$run" "$tmp")" || [[ ! -s "$tmp" ]]; then
+  echo "review-deploy-pr: the reviewer failed for PR #$number" >&2
+  exit 1
+fi
+
+# Check the models that actually answered, too (e.g. no silent fallback).
+for m in $used; do
+  if [[ " $authors " == *" $(bin/review-tools family "$m") "* ]]; then
+    echo "review-deploy-pr: the review was answered by $m, the same family as the author; not saved" >&2
+    exit 1
+  fi
+done
+
+# Keep the previous review (and the verdicts ticked in it) in the archive.
+if [[ -e "$out" ]]; then
+  mkdir -p reviews/archive
+  old="reviews/archive/pr-${slug}-$(reviewed_head "$out" | cut -c1-7).md"
+  [[ -e "$old" ]] && old="${old%.md}-$(date -u +%Y%m%dT%H%M%S).md"
+  mv "$out" "$old"
+fi
+
+{
+  echo "# Review of PR #${number}: ${title}"
+  echo
+  echo "- PR: #${number} ${url}$([[ "$draft" == true ]] && echo " (draft)")"
+  echo "- Branch: \`${branch}\`"
+  echo "- Base: \`${base}\` (merge base with \`${base_branch}\`)"
+  echo "- Head: \`${head}\`"
+  echo "- Reviewer: ${used//$'\n'/, } (bin/review-deploy-pr, isolated process)"
+  echo "- Written with: ${authors:-no Claude model in the commits}"
+  echo "- CI: ${ci_status}"
+  echo "- Date: $(date -u +%Y-%m-%dT%H:%MZ)"
+  echo
+  # Anything the reviewer wrote before its summary is narration, not review.
+  if grep -q '^## Summary' "$tmp"; then sed -n '/^## Summary/,$p' "$tmp"; else cat "$tmp"; fi
+} >"$out"
+
+# The verdict lines are what the user ticks and /post-review reads; add any the
+# reviewer left out.
+verdict='- **Your verdict:** [ ] valid  [ ] wrong  [ ] unsure — reason:'
+awk -v verdict="$verdict" '
+  function flush() {
+    if (n == 0) return
+    if (finding && !has) {
+      while (n > 0 && buf[n] == "") n--
+      buf[++n] = verdict; buf[++n] = ""
+    }
+    for (i = 1; i <= n; i++) print buf[i]
+    n = 0; has = 0
+  }
+  /^##/ { flush(); finding = ($0 ~ /^### F[0-9]+ /) }
+  { buf[++n] = $0; if (index($0, "Your verdict")) has = 1 }
+  END { flush() }
+' "$out" >"$tmp" && cat "$tmp" >"$out"
+
+# Every cited path:line must exist at the head commit; flag those that don't.
+bad="$(bin/review-tools check-locations "$out" "$head")"
+
+count() { grep -cE "^### F[0-9]+ · $1 " "$out" || true; }
+echo "reviewed: $out — blocker $(count blocker), should-fix $(count should-fix), nit $(count nit), question $(count question)$([[ $bad != 0 ]] && echo ", $bad location(s) flagged")"

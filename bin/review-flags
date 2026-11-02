@@ -1,0 +1,16 @@
+# shellcheck shell=bash
+# The flags every reviewer process runs with. Sourced by bin/review-deploy-pr and
+# bin/review-selfcheck, so the self-check always tests exactly these.
+#
+#   --restricted              ignore user/project/local settings; confine the
+#                             file tools to the working directory (a worktree)
+#   --strict-mcp-config       no MCP servers or claude.ai connectors
+#   --tools / --allowedTools  only Read, Grep and Glob: no shell, no Write/Edit
+#   --no-session-persistence  nothing saved as a session
+review_flags=(
+  --restricted
+  --strict-mcp-config
+  --no-session-persistence
+  --tools "Read,Grep,Glob"
+  --allowedTools "Read Grep Glob"
+)

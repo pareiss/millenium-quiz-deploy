@@ -1,3 +1,12 @@
 # real secrets never go into git
 overlays/*/secrets.env
 overlays/*/postgres.env
+
+# PR reviews are local working notes (see REVIEWING.md); review checkouts and
+# personal Claude Code settings stay local too.
+/reviews/
+/.claude/worktrees/
+/.claude/settings.local.json
+
+# Python bytecode from the review helper tests
+__pycache__/
