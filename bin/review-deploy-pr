@@ -60,6 +60,7 @@ cd "$root"
 # gh may only talk to this repository, whatever the environment or cwd says.
 GH_REPO="$(bin/review-tools repo)"
 export GH_REPO
+reviews="$(bin/review-dir)"
 # shellcheck source=bin/review-flags
 source bin/review-flags
 
@@ -81,8 +82,8 @@ IFS=$'\t' read -r head base_tip base_branch branch draft url title <<<"$pr"
 
 short="${head:0:7}"
 slug="$(printf '%s' "$branch" | sed 's/[^A-Za-z0-9._-]/-/g')"
-mkdir -p reviews
-out="reviews/pr-${slug}.md"
+mkdir -p "$reviews"
+out="$reviews/pr-${slug}.md"
 reviewed_head() { sed -n 's/^- Head: `\([0-9a-f]*\)`.*/\1/p' "$1" | head -1; }
 
 if [[ -e "$out" && "$force" != true && "$(reviewed_head "$out")" == "$head" ]]; then
@@ -268,8 +269,8 @@ done
 
 # Keep the previous review (and the verdicts ticked in it) in the archive.
 if [[ -e "$out" ]]; then
-  mkdir -p reviews/archive
-  old="reviews/archive/pr-${slug}-$(reviewed_head "$out" | cut -c1-7).md"
+  mkdir -p "$reviews/archive"
+  old="$reviews/archive/pr-${slug}-$(reviewed_head "$out" | cut -c1-7).md"
   [[ -e "$old" ]] && old="${old%.md}-$(date -u +%Y%m%dT%H%M%S).md"
   mv "$out" "$old"
 fi

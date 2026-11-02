@@ -71,7 +71,8 @@ Read first: `README.md` (layout, first deployment, secrets), then
    that wrote the change (the `Co-Authored-By` trailers decide), in an isolated
    process that sees only the diff, the rendered manifests and the written
    docs. Every finding is a claim the owner judges; the review file is
-   `reviews/pr-<branch>.md` (gitignored).
+   `reviews/pr-<branch>.md` in the main checkout (gitignored; `bin/review-dir`
+   prints the path, also when you work in a worktree).
 4. The owner ticks "valid", "wrong" or "unsure" in the review file. When the
    user says the verdicts are marked, first remind them to run
    `/post-review <PR>` (`bin/review-post`), so the PR shows every finding with

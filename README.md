@@ -130,6 +130,7 @@ REVIEW_MODEL=fable bin/review-deploy-pr 12 --force   # another model, review aga
 bin/review-selfcheck --force     # re-verify the isolation
 bin/review-post 12 --dry-run     # preview the evaluated review as a PR comment
 bin/review-cleanup               # archive reviews of merged or closed PRs
+bin/review-dir                   # print the reviews directory (main checkout)
 ```
 
 Guarantees, each checked by the scripts rather than promised:
@@ -168,6 +169,9 @@ and offline itself, *before* the reviewer starts, and puts the output into
 `cluster/` holds plain manifests and is only read, not rendered.
 
 There is **one current review per PR**, `reviews/pr-<branch>.md` (gitignored);
+the reviews directory is always `reviews/` of the **main checkout**, even when
+you run a command from a worktree (`bin/review-dir` prints it), so reviews do
+not vanish with a worktree;
 its header names the commit it covers. A PR is reviewed again only when it has
 new commits (or with `--force`); the previous review moves to
 `reviews/archive/` with the verdicts you ticked.

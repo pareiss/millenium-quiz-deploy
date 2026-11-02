@@ -16,11 +16,12 @@ cd "$root"
 # gh may only talk to this repository (the origin remote).
 GH_REPO="$(bin/review-tools repo)"
 export GH_REPO
+reviews="$(bin/review-dir)"
 shopt -s nullglob
 
 moved=0
 unchecked=0
-for file in reviews/pr-*.md; do
+for file in "$reviews"/pr-*.md; do
   number="$(sed -n 's/^- PR: #\([0-9]*\).*/\1/p' "$file" | head -1)"
   if [[ -z "$number" ]]; then
     echo "review cleanup: skipped $file: no \"- PR: #<number>\" line in its header" >&2
@@ -36,11 +37,11 @@ for file in reviews/pr-*.md; do
 
   name="$(basename "$file" .md)"
   head="$(sed -n 's/^- Head: `\([0-9a-f]\{7\}\).*/\1/p' "$file" | head -1)"
-  mkdir -p reviews/archive
-  dest="reviews/archive/${name}-${head:-unknown}-$(tr '[:upper:]' '[:lower:]' <<<"$state").md"
+  mkdir -p "$reviews/archive"
+  dest="$reviews/archive/${name}-${head:-unknown}-$(tr '[:upper:]' '[:lower:]' <<<"$state").md"
   [[ -e "$dest" ]] && dest="${dest%.md}-$(date -u +%Y%m%dT%H%M%S).md"
   mv "$file" "$dest"
-  rm -f "reviews/logs/${name}.log"
+  rm -f "$reviews/logs/${name}.log"
   echo "archived #$number ($state): $file -> $dest"
   moved=$((moved + 1))
 done

@@ -19,6 +19,7 @@ root="$(git rev-parse --show-toplevel)"
 cd "$root"
 # shellcheck source=bin/review-flags
 source bin/review-flags
+reviews="$(bin/review-dir)"
 
 for flag in --restricted --strict-mcp-config --no-session-persistence --tools --allowedTools; do
   claude --help 2>&1 | grep -q -- "$flag" ||
@@ -27,8 +28,8 @@ done
 
 version="$(claude --version | awk '{print $1}')"
 key="$(printf '%s\n' "${review_flags[@]}" | sha256sum | cut -c1-12)"
-mkdir -p reviews/.selfcheck
-stamp="reviews/.selfcheck/claude-${version}-${key}"
+mkdir -p "$reviews/.selfcheck"
+stamp="$reviews/.selfcheck/claude-${version}-${key}"
 if [[ -e "$stamp" && "${1:-}" != --force ]]; then
   exit 0
 fi

@@ -6,5 +6,5 @@ allowed-tools: Bash(bin/review-cleanup:*)
 ---
 
 Run `bin/review-cleanup` from the repository root and report which reviews it
-moved to `reviews/archive/` (and for which PRs), or that there was nothing to
+moved to `reviews/archive/` (in the main checkout; `bin/review-dir` prints the directory) (and for which PRs), or that there was nothing to
 archive. The files are moved, not deleted, so ticked verdicts stay available.

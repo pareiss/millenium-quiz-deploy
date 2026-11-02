@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Prints the absolute path of the reviews directory: <main checkout>/reviews.
+#
+# The main checkout is the parent of the repository's common git directory, so
+# the answer is the same from the main checkout and from any of its worktrees.
+# Reviews therefore never end up inside a worktree, where they would vanish
+# with it. Every script and skill that reads or writes reviews/ asks this one
+# command (reviews/archive/ and reviews/logs/ live under it).
+#
+#   bin/review-dir            # e.g. /home/me/millennium-quiz-deploy/reviews
+set -euo pipefail
+
+common="$(git rev-parse --path-format=absolute --git-common-dir)"
+printf '%s/reviews\n' "$(dirname "$common")"

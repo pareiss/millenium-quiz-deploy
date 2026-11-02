@@ -17,7 +17,7 @@ import tempfile
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-COPIED = ["review-deploy-pr", "review-flags", "review-tools", "review-cleanup", "review-selfcheck"]
+COPIED = ["review-dir", "review-post", "review-deploy-pr", "review-flags", "review-tools", "review-cleanup", "review-selfcheck"]
 
 FAKE_GH = r"""#!/usr/bin/env bash
 echo "GH_REPO=$GH_REPO $*" >> "$FAKE_LOG/gh.log"
@@ -101,7 +101,7 @@ class ReviewDeployPrTest(unittest.TestCase):
     def commit(self, message):
         self.git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", message)
 
-    def review(self, result="## Summary\nFine.\n\n## Findings\nNo findings.\n", model="claude-opus-4-7"):
+    def review(self, result="## Summary\nFine.\n\n## Findings\nNo findings.\n", model="claude-opus-4-7", cwd=None):
         env = dict(
             os.environ,
             PATH=self.fakebin + os.pathsep + os.environ["PATH"],
@@ -111,7 +111,7 @@ class ReviewDeployPrTest(unittest.TestCase):
             REVIEW_CLEANED="1",
         )
         return subprocess.run(
-            ["bin/review-deploy-pr", "7", "--force"], cwd=self.repo, env=env, capture_output=True, text=True
+            ["bin/review-deploy-pr", "7", "--force"], cwd=cwd or self.repo, env=env, capture_output=True, text=True
         )
 
     def material(self, name):
@@ -182,6 +182,27 @@ class ReviewDeployPrTest(unittest.TestCase):
         done = self.review(model="claude-sonnet-5-5")
         self.assertEqual(done.returncode, 1)
         self.assertFalse(os.path.exists(os.path.join(self.repo, "reviews", "pr-feature.md")))
+
+    def make_worktree(self):
+        wt = os.path.join(self.tmp.name, "wt")
+        self.git("worktree", "add", "-q", "--detach", wt, "feature")
+        return wt
+
+    def test_reviews_dir_is_the_main_checkouts_also_from_a_worktree(self):
+        wt = self.make_worktree()
+        expected = os.path.realpath(os.path.join(self.repo, "reviews"))
+        for cwd in (self.repo, wt, os.path.join(wt, "base")):
+            out = subprocess.run(
+                [os.path.join(wt, "bin", "review-dir")], cwd=cwd, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(os.path.realpath(out), expected)
+
+    def test_review_run_from_a_worktree_is_written_to_the_main_checkout(self):
+        wt = self.make_worktree()
+        done = self.review(cwd=wt)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "reviews", "pr-feature.md")))
+        self.assertFalse(os.path.exists(os.path.join(wt, "reviews")))
 
 
 if __name__ == "__main__":

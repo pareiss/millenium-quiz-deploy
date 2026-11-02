@@ -24,7 +24,8 @@ cd "$root"
 # gh may only talk to this repository (the origin remote).
 GH_REPO="$(bin/review-tools repo)"
 export GH_REPO
-mkdir -p reviews/logs
+reviews="$(bin/review-dir)"
+mkdir -p "$reviews/logs"
 
 bin/review-cleanup
 export REVIEW_CLEANED=1
@@ -53,7 +54,7 @@ status_dir="$(mktemp -d)"
 trap 'rm -rf "$status_dir"' EXIT
 
 run() {
-  local n="$1" log="reviews/logs/pr-${slug[$1]}.log" code=0
+  local n="$1" log="$reviews/logs/pr-${slug[$1]}.log" code=0
   bin/review-deploy-pr "$n" "${force[@]}" >"$log" 2>&1 || code=$?
   echo "$code" >"$status_dir/$n"
   case "$code" in
@@ -74,7 +75,7 @@ printf '%-5s %-9s %-8s %-10s %-4s %-8s %-10s %s\n' PR status blocker should-fix 
 failed=0
 for n in "${numbers[@]}"; do
   code="$(cat "$status_dir/$n" 2>/dev/null || echo 1)"
-  file="reviews/pr-${slug[$n]}.md"
+  file="$reviews/pr-${slug[$n]}.md"
   [[ -e "$file" ]] || file=""
   case "$code" in
     0) status=reviewed ;;

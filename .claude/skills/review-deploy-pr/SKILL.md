@@ -1,6 +1,6 @@
 ---
 name: review-deploy-pr
-description: Review one pull request in a separate, isolated reviewer process and save the review to reviews/ for the user to evaluate.
+description: Review one pull request in a separate, isolated reviewer process and save the review to reviews/ (of the main checkout, see bin/review-dir) for the user to evaluate.
 argument-hint: <pr-number> [--force]
 disable-model-invocation: true
 allowed-tools: Bash(bin/review-deploy-pr:*), Read
