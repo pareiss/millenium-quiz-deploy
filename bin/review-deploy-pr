@@ -123,7 +123,13 @@ fi
 # reach the owner's files (the decrypted overlays/*/secrets.env of this
 # checkout) from there. Nothing in this script writes, deletes or reads
 # through a path the PR controls: symlinks are removed from the checkouts
-# before anything is rendered (see drop_symlinks).
+# before anything is rendered (see drop_symlinks). kustomize itself is kept
+# inside the checkout in two layers: bin/review-tools check-kustomizations
+# refuses to render any kustomization with an absolute path, a ".." path out
+# of the checkout, a remote reference or a helm chart (or one that loads such
+# a directory), and the render runs with the default load restrictor, no
+# helm, no plugins and, where bwrap or unshare works, without network (and
+# with bwrap also without access to the home directory).
 wtroot="$(mktemp -d)"
 worktree="$wtroot/pr"
 base_worktree="$wtroot/base"
@@ -178,14 +184,20 @@ fi
 # which is not in a checkout, so the committed *.example is copied in as a
 # stand-in (placeholder values; real secrets are never read). Rendered Secret
 # documents are dropped anyway.
-render_all() { # <worktree> <outdir>: writes <outdir>/<overlay>.yaml or .error
-  local wt="$1" out="$2" dir name placeholders=() p
+render_all() { # <worktree> <outdir>: writes <outdir>/<overlay>.yaml, .error or .refused
+  local wt="$1" out="$2" dir name placeholders=() p refusals reasons
   mkdir -p "$out"
+  refusals="$(bin/review-tools check-kustomizations "$wt")"
   for dir in "$wt"/base "$wt"/overlays/*/; do
     dir="${dir%/}"; name="$(basename "$dir")"
     # symlinks were removed already; refuse them again where a path is written
     [[ -L "$dir" || -L "$dir/secrets.env" || -L "$dir/secrets.env.example" ]] && continue
     [[ -f "$dir/kustomization.yaml" ]] || continue
+    reasons="$(awk -F'\t' -v d="${dir#"$wt"/}" '$1 == d {print $2}' <<<"$refusals")"
+    if [[ -n "$reasons" ]]; then
+      printf '%s\n' "$reasons" >"$out/$name.refused"
+      continue
+    fi
     if [[ -f "$dir/secrets.env.example" && ! -e "$dir/secrets.env" ]]; then
       cp "$dir/secrets.env.example" "$dir/secrets.env"
       placeholders+=("$dir/secrets.env")
@@ -202,9 +214,27 @@ render_all() { # <worktree> <outdir>: writes <outdir>/<overlay>.yaml or .error
   for p in ${placeholders[@]+"${placeholders[@]}"}; do rm -f "$p"; done
 }
 
+# kustomize runs with the default load restrictor (never LoadRestrictionsNone),
+# no helm and no plugins, with the variables that switch plugins on removed,
+# and, where possible, in a sandbox without network. bwrap also hides the home
+# directory (the owner's checkout, keys, credentials) and keeps only the
+# throwaway checkouts; unshare can only cut the network.
 kust=()
+kust_flags=(--load-restrictor=LoadRestrictionsRootOnly --enable-helm=false --enable-alpha-plugins=false)
 if command -v kubectl >/dev/null; then kust=(kubectl kustomize)
 elif command -v kustomize >/dev/null; then kust=(kustomize build); fi
+kust_sandbox="none"
+if [[ ${#kust[@]} -gt 0 ]]; then
+  if command -v bwrap >/dev/null &&
+     bwrap --unshare-net --ro-bind / / --dev /dev --tmpfs "$HOME" --ro-bind "$wtroot" "$wtroot" true 2>/dev/null; then
+    kust_sandbox="bwrap"
+    kust=(bwrap --unshare-all --die-with-parent --ro-bind / / --dev /dev --tmpfs "$HOME" --ro-bind "$wtroot" "$wtroot" "${kust[@]}")
+  elif command -v unshare >/dev/null && unshare --map-root-user --net true 2>/dev/null; then
+    kust_sandbox="unshare"
+    kust=(unshare --map-root-user --net "${kust[@]}")
+  fi
+  kust=(env -u KUSTOMIZE_ENABLE_ALPHA_PLUGINS -u KUSTOMIZE_PLUGIN_HOME -u XDG_CONFIG_HOME "${kust[@]}" "${kust_flags[@]}")
+fi
 
 {
   echo "# Offline checks run by bin/review-deploy-pr before the review"
@@ -231,14 +261,23 @@ elif command -v kustomize >/dev/null; then kust=(kustomize build); fi
   if [[ ${#kust[@]} -eq 0 ]]; then
     echo "Not run: neither kubectl nor kustomize is installed."
   else
+    case "$kust_sandbox" in
+      bwrap) echo "Sandbox: bwrap, no network, home directory hidden, default load restrictor, no helm, no plugins." ;;
+      unshare) echo "Sandbox: unshare, no network (the filesystem is NOT isolated: bwrap is missing or not usable); default load restrictor, no helm, no plugins." ;;
+      *) echo "Sandbox: NONE (neither bwrap nor unshare is usable); only the default load restrictor, no helm, no plugins, and the path check below protect the render." ;;
+    esac
+    echo
     render_all "$worktree" "$material/rendered/head"
     git worktree add --quiet --detach "$base_worktree" "$base"
     drop_symlinks "$base_worktree" >/dev/null
     render_all "$base_worktree" "$material/rendered/base"
-    for f in "$material"/rendered/head/*.yaml "$material"/rendered/head/*.error; do
+    for f in "$material"/rendered/head/*.yaml "$material"/rendered/head/*.error "$material"/rendered/head/*.refused; do
       [[ -e "$f" ]] || continue
       name="$(basename "$f")"; name="${name%.*}"
-      if [[ "$f" == *.error ]]; then
+      if [[ "$f" == *.refused ]]; then
+        echo "- \`$name\`: NOT RENDERED, refused because it could reach outside the checkout (a PR must not make the render read other files or fetch anything):"
+        sed 's/^/    /' "$f" | head -20
+      elif [[ "$f" == *.error ]]; then
         echo "- \`$name\`: BUILD FAILED"; sed 's/^/    /' "$f" | head -20
       else
         echo "- \`$name\`: builds ($(grep -c '^kind:' "$f") resources) -> .review/rendered/head/$name.yaml"
@@ -273,7 +312,7 @@ elif command -v kustomize >/dev/null; then kust=(kustomize build); fi
   echo
   echo "Files under cluster/ are plain manifests, not a kustomization; they are not rendered, only read."
 } >"$material/checks.md"
-rm -f "$material"/rendered/*/*.error 2>/dev/null || true
+rm -f "$material"/rendered/*/*.error "$material"/rendered/*/*.refused 2>/dev/null || true
 
 prompt="Review pull request #${number} (branch ${branch} into ${base_branch}).
 Base commit (merge base): ${base}

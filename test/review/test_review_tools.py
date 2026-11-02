@@ -312,5 +312,68 @@ class ReviewToolsTest(unittest.TestCase):
         self.assertEqual(out, ["busybox: no tag", "localhost:5000/app: no tag", "nginx:latest: tag latest"])
 
 
+class CheckKustomizationsTest(unittest.TestCase):
+    def check(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            root = os.path.join(tmp, "co")
+            for rel, text in files.items():
+                path = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(text)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tools.check_kustomizations(root)
+            return [l.split("\t") for l in buf.getvalue().splitlines()]
+
+    def k(self, body):
+        return "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n" + body
+
+    def test_legit_layout_passes(self):
+        self.assertEqual(self.check({
+            "base/kustomization.yaml": self.k("resources:\n  - a/b.yaml\n"),
+            "overlays/x/kustomization.yaml": self.k(
+                "resources:\n  - ../../base\nsecretGenerator:\n  - name: s\n    envs:\n      - secrets.env\n"
+                "patches:\n  - target: {kind: ConfigMap}\n    patch: |-\n      - op: replace\n        path: /data/X\n        value: y\n"
+                "  - path: p.yaml\n"),
+        }), [])
+
+    def test_each_kind_of_escape_is_refused(self):
+        cases = {
+            "resources:\n  - /etc\n": "absolute",
+            "resources:\n  - ../../x\n": "outside",
+            "components:\n  - ../../../c\n": "outside",
+            "bases:\n  - ../..\n": "outside",
+            "resources:\n  - https://h/x\n": "remote",
+            "resources:\n  - git@github.com:o/r.git\n": "remote",
+            "resources:\n  - github.com/o/r//base?ref=v1\n": "remote",
+            "resources:\n  - gitlab.example.org/o/r\n": "remote",
+            "patches:\n  - path: /etc/passwd\n": "absolute",
+            "patchesStrategicMerge:\n  - ../../p.yaml\n": "outside",
+            "patchesJson6902:\n  - path: ../../p.json\n    target: {kind: X}\n": "outside",
+            "secretGenerator:\n  - name: s\n    envs:\n      - ../../s.env\n": "outside",
+            "configMapGenerator:\n  - name: s\n    files:\n      - k=/etc/hosts\n": "absolute",
+            "configMapGenerator:\n  - name: s\n    env: ../../e\n": "outside",
+            "replacements:\n  - path: ../../r.yaml\n": "outside",
+            "helmCharts:\n  - name: c\n": "helm",
+            "resources: [": "parsed",
+        }
+        for body, word in cases.items():
+            found = self.check({"x/kustomization.yaml": self.k(body)})
+            self.assertTrue(found and found[0][0] == "x" and word in found[0][1], (body, found))
+
+    def test_dir_dotdot_inside_the_checkout_is_fine_and_taint_propagates(self):
+        found = self.check({
+            "a/kustomization.yaml": self.k("resources:\n  - ../b/../c\n"),
+            "c/kustomization.yaml": self.k("resources:\n  - /abs\n"),
+            "d/kustomization.yml": self.k("resources:\n  - ../a\n"),
+        })
+        dirs = sorted(d for d, _ in found)
+        self.assertEqual(dirs, ["a", "c", "d"])
+        self.assertTrue(any("references refused `c`" in r for d, r in found if d == "a"))
+        self.assertTrue(any("references refused `a`" in r for d, r in found if d == "d"))
+
+
 if __name__ == "__main__":
     unittest.main()

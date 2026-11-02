@@ -20,8 +20,12 @@
                                                   (names the file and kind, never prints the value)
   review-tools image-lint < yaml                  images in rendered output without a tag/digest or with :latest
   review-tools strip-secrets < yaml               drops Secret documents from rendered kustomize output
+  review-tools check-kustomizations <checkout>    refusals, one "<dir>\t<reason>" per line, for every kustomization in
+                                                  the checkout that reaches outside it (absolute or escaping ".." paths,
+                                                  remote refs, helm charts) or that references a refused directory
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -361,9 +365,136 @@ def image_lint(text=None):
             print(f"{image}: tag latest")
 
 
+KUSTOMIZATION_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
+# Fields whose entries are paths (a file or a directory) kustomize loads.
+PATH_LIST_FIELDS = ("resources", "components", "bases", "crds", "configurations", "generators",
+                    "transformers", "validators", "patchesStrategicMerge")
+REMOTE_REF = re.compile(
+    r"://|^[\w.-]+@[\w.-]+:|^git::|^(?:github|gitlab|bitbucket)\.[a-z]+[/:]|\.git(?://|\?|$)", re.I)
+HOST_LIKE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
+
+
+def _path_problem(root, kdir, value):
+    """Why kustomize must not be asked to load this path, or None. `root` is
+    the real path of the checkout, `kdir` the directory of the kustomization."""
+    if not isinstance(value, str) or not value.strip():
+        return "entry is not a path string" if not isinstance(value, str) else None
+    if REMOTE_REF.search(value):
+        return f"remote reference `{value}`"
+    if os.path.isabs(value) or value.startswith(("~", "\\")) or re.match(r"^[A-Za-z]:[\\/]", value):
+        return f"absolute path `{value}`"
+    first = value.split("/", 1)[0]
+    if "/" in value and HOST_LIKE.match(first) and not os.path.exists(os.path.join(kdir, first)):
+        return f"looks like a remote reference `{value}`"
+    target = os.path.realpath(os.path.join(kdir, value))
+    if target != root and not target.startswith(root + os.sep):
+        return f"path `{value}` resolves outside the checkout"
+    return None
+
+
+def _paths_of(doc):
+    """(field, value) for every path-like entry of a parsed kustomization."""
+    def entries(field):
+        v = doc.get(field)
+        return v if isinstance(v, list) else ([] if v is None else [v])
+    for field in PATH_LIST_FIELDS:
+        for v in entries(field):
+            # patchesStrategicMerge entries may be inline YAML (multi-line)
+            if field == "patchesStrategicMerge" and isinstance(v, str) and "\n" in v:
+                continue
+            yield field, v
+    for field in ("patches", "patchesJson6902"):
+        for v in entries(field):
+            if isinstance(v, dict) and v.get("path") is not None:
+                yield f"{field}.path", v["path"]
+    for v in entries("replacements"):
+        if isinstance(v, dict) and v.get("path") is not None:
+            yield "replacements.path", v["path"]
+    if isinstance(doc.get("openapi"), dict) and doc["openapi"].get("path") is not None:
+        yield "openapi.path", doc["openapi"]["path"]
+    for gen in ("configMapGenerator", "secretGenerator"):
+        for g in entries(gen):
+            if not isinstance(g, dict):
+                continue
+            for env in ([g["env"]] if "env" in g else []) + (g.get("envs") or []):
+                yield f"{gen}.envs", env
+            for f in g.get("files") or []:
+                yield f"{gen}.files", f
+                if isinstance(f, str) and "=" in f:
+                    yield f"{gen}.files", f.split("=", 1)[1]
+    for h in entries("helmCharts") + entries("helmGlobals"):
+        yield "helm", None  # handled by the caller
+
+
+def check_kustomizations(checkout):
+    """Prints "<dir relative to the checkout>\t<reason>" for every kustomization
+    that must not be rendered: one with an absolute path, a ".." path leaving
+    the checkout, a remote reference (git, URL), a helm chart, or one that
+    cannot be parsed; and every kustomization that references such a directory.
+    Fail closed: without PyYAML nothing can be verified, so everything is refused."""
+    root = os.path.realpath(checkout)
+    kfiles = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        kfiles += [os.path.join(base, n) for n in KUSTOMIZATION_NAMES if n in files]
+    problems, deps = {}, {}
+    rel = lambda d: os.path.relpath(d, root)
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    for kfile in sorted(kfiles):
+        kdir = os.path.dirname(kfile)
+        mine = problems.setdefault(rel(kdir), [])
+        name = os.path.basename(kfile)
+        if yaml is None:
+            mine.append(f"{name}: cannot be checked (python3 PyYAML is not installed)")
+            continue
+        try:
+            with open(kfile) as f:
+                doc = yaml.safe_load(f)
+        except Exception as e:  # noqa: BLE001 - any parse failure means "cannot verify"
+            mine.append(f"{name}: cannot be parsed ({type(e).__name__})")
+            continue
+        if doc is None:
+            continue
+        if not isinstance(doc, dict):
+            mine.append(f"{name}: not a mapping")
+            continue
+        for field, value in _paths_of(doc):
+            if field == "helm":
+                mine.append(f"{name}: helmCharts need helm, which is never run here")
+                continue
+            why = _path_problem(root, kdir, value)
+            if why:
+                mine.append(f"{name}: {field}: {why}")
+            elif field in ("resources", "components", "bases") and isinstance(value, str):
+                target = os.path.realpath(os.path.join(kdir, value))
+                if os.path.isdir(target):
+                    deps.setdefault(rel(kdir), set()).add(rel(target))
+    # a directory is refused too when anything it loads is refused
+    changed = True
+    while changed:
+        changed = False
+        for d, targets in deps.items():
+            for t in sorted(targets):
+                if problems.get(t) and not any(x.startswith(f"references refused `{t}`") for x in problems[d]):
+                    problems[d].append(f"references refused `{t}`")
+                    changed = True
+    for d, reasons in sorted(problems.items()):
+        for r in reasons:
+            print(f"{d}\t{r}")
+
+
 def strip_secrets(text=None):
     """Removes `kind: Secret` documents from rendered kustomize output, so
-    generated secrets never land in the review material."""
+    generated secrets never land in the review material.
+
+    Limit: this only recognises `kind: Secret`. A ConfigMap (or any other
+    kind) that a kustomization filled with secret values, e.g. through a
+    `replacements:` entry, is NOT dropped. What keeps real secrets out is that
+    the render only ever sees placeholder files (secrets.env.example) and that
+    check-kustomizations refuses kustomizations reaching outside the checkout."""
     text = sys.stdin.read() if text is None else text
     docs = re.split(r"(?m)^---\s*$", text)
     kept = [d for d in docs if not re.search(r"(?m)^kind:\s*Secret\s*$", d)]
@@ -385,6 +516,7 @@ if __name__ == "__main__":
         "repo": repo,
         "scan-secrets": scan_secrets,
         "strip-secrets": strip_secrets,
+        "check-kustomizations": check_kustomizations,
         "image-lint": image_lint,
     }
     if cmd not in commands:

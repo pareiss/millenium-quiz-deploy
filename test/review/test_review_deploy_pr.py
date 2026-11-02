@@ -209,6 +209,45 @@ class ReviewDeployPrTest(unittest.TestCase):
         with open(os.path.join(self.log, "checkout.txt")) as f:
             self.assertNotIn("evil", f.read())
 
+    def test_kustomizations_reaching_outside_the_checkout_are_refused_not_rendered(self):
+        real = os.path.join(self.repo, "overlays", "local")
+        self.write("overlays/local/secrets.env", "TOKEN=REAL-SECRET\n")
+        outside = os.path.join(self.tmp.name, "outside.env")
+        with open(outside, "w") as f:
+            f.write("TOKEN=OUTSIDE-SECRET\n")
+        evil = {
+            "abs": f"resources:\n  - {real}\n",
+            "up": "resources:\n  - ../../../repo/overlays/local\n",
+            "url": "resources:\n  - https://example.invalid/x.git//base?ref=v1\n",
+            "ssh": "resources:\n  - git@github.com:me/private.git//base\n",
+            "env": "resources:\n  - ../../base\nsecretGenerator:\n  - name: s\n    envs:\n      - ../../../outside.env\n",
+            "viabase": "resources:\n  - ../abs\n",
+        }
+        for name, body in evil.items():
+            self.write(f"overlays/{name}/kustomization.yaml",
+                       "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n" + body)
+        self.git("add", "-A")
+        self.commit("evil overlays")
+        done = self.review()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        checks = self.material("checks.md")
+        rendered = os.path.join(self.log, "review-material", "rendered", "head")
+        for name in evil:
+            self.assertIn(f"`{name}`: NOT RENDERED", checks)
+            self.assertFalse(os.path.exists(os.path.join(rendered, name + ".yaml")), name)
+        self.assertIn("absolute path", checks)
+        self.assertIn("resolves outside the checkout", checks)
+        self.assertIn("remote reference", checks)
+        self.assertIn("references refused `overlays/abs`", checks)
+        self.assertIn("Sandbox:", checks)
+        # the legitimate overlay and base still render
+        self.assertIn("`local`: builds", checks)
+        self.assertIn("`base`: builds", checks)
+        for name in os.listdir(rendered):
+            with open(os.path.join(rendered, name)) as f:
+                self.assertNotIn("SECRET", f.read())
+        self.assertNotIn("SECRET", checks)
+
     def test_review_material_a_pr_committed_is_cleared(self):
         self.write(".review/rendered/head/fake.yaml", "kind: Fake\n")
         self.write(".review/checks.md", "all good\n")
