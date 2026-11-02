@@ -7,7 +7,7 @@
   review-tools run-result <json> <text-out>       review text of a `claude -p --output-format json` run;
                                                   prints the models that answered, one per line
   review-tools check-locations <review> <head>    flags cited path:line that don't exist at head
-  review-tools selfcheck <stream-json> <inside-token> <outside-token>
+  review-tools selfcheck <stream-json> <inside-token> <outside-token> <context-token> <outside-path>...
   review-tools post-body <review> <pr-commits.json> <evaluator>
                                                   PR comment with every finding, its verdict and
                                                   the commits that address it
@@ -106,9 +106,11 @@ def check_locations(review_path, head):
     print(bad)
 
 
-def selfcheck(stream_path, inside, outside):
-    """Passes only if the session had exactly Read, Grep and Glob, actually read
-    the inside file, and nothing from outside the working directory got in."""
+def selfcheck(stream_path, inside, outside, context, *outside_paths):
+    """Passes only if the session had exactly Read, Grep and Glob, read the inside
+    file, ATTEMPTED every given outside path and was denied each time (a tool_use
+    naming it, answered by an error tool_result), and neither the outside token
+    nor the token of the context files in the parent directory got in."""
     with open(stream_path) as f:
         raw = f.read()
     events = [json.loads(l) for l in raw.splitlines() if l.strip().startswith("{")]
@@ -122,9 +124,28 @@ def selfcheck(stream_path, inside, outside):
         problems.append("the file inside the working directory was not read (inconclusive run)")
     if outside in raw:
         problems.append("a file OUTSIDE the working directory was read")
+    if context in raw:
+        problems.append("a context file (CLAUDE.md/AGENTS.md) of a PARENT directory was loaded")
+
+    uses, results = {}, {}
+    for e in events:
+        content = (e.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "tool_use":
+                uses[block.get("id")] = json.dumps(block.get("input", {}))
+            elif block.get("type") == "tool_result":
+                results[block.get("tool_use_id")] = bool(block.get("is_error"))
+    for path in outside_paths:
+        ids = [i for i, inp in uses.items() if json.dumps(path)[1:-1] in inp]
+        if not ids:
+            problems.append(f"access to {path} was never attempted (inconclusive run)")
+        elif not all(results.get(i) for i in ids):
+            problems.append(f"access to {path} was attempted but not denied with an error")
     if problems:
         sys.exit("self-check failed: " + "; ".join(problems))
-    print("self-check passed: tools are Read, Grep, Glob only; inside read, outside blocked")
+    print("self-check passed: tools are Read, Grep, Glob only; inside read; outside and parent context attempted and denied")
 
 
 def parse_review(path):

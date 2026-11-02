@@ -81,6 +81,47 @@ class ReviewToolsTest(unittest.TestCase):
             fun(*args)
         return out.getvalue()
 
+    def selfcheck(self, events, *outside_paths):
+        path = os.path.join(self.dir.name, "stream.json")
+        with open(path, "w") as f:
+            f.write("\n".join(json.dumps(e) for e in events))
+        try:
+            self.run_tool(tools.selfcheck, path, "IN-1", "OUT-2", "CTX-3", *outside_paths)
+        except SystemExit as e:
+            return str(e)
+        return None
+
+    @staticmethod
+    def stream(denied=True, attempt=True, leak=""):
+        init = {"type": "system", "subtype": "init", "tools": ["Read", "Grep", "Glob"]}
+        use = lambda i, p: {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": i, "input": {"file_path": p}}]}}
+        res = lambda i, text, err: {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": i, "content": text, "is_error": err}]}}
+        events = [init, use("a", "marker.txt"), res("a", "IN-1", False)]
+        if attempt:
+            events += [use("b", "/p/marker.txt"), res("b", "denied" if denied else "OUT-2", denied)]
+        events.append({"type": "result", "result": "done " + leak})
+        return events
+
+    def test_selfcheck_passes_when_outside_access_was_attempted_and_denied(self):
+        self.assertIsNone(self.selfcheck(self.stream(), "/p/marker.txt"))
+
+    def test_selfcheck_fails_when_outside_access_was_never_attempted(self):
+        self.assertIn("never attempted", self.selfcheck(self.stream(attempt=False), "/p/marker.txt"))
+
+    def test_selfcheck_fails_when_outside_read_was_not_denied(self):
+        out = self.selfcheck(self.stream(denied=False), "/p/marker.txt")
+        self.assertIn("OUTSIDE", out)
+        self.assertIn("not denied", out)
+
+    def test_selfcheck_fails_when_a_parent_context_file_was_loaded(self):
+        self.assertIn("PARENT", self.selfcheck(self.stream(leak="the code word is CTX-3"), "/p/marker.txt"))
+
+    def test_selfcheck_fails_with_other_tools_or_without_the_inside_read(self):
+        events = self.stream()
+        events[0]["tools"].append("Bash")
+        self.assertIn("available tools", self.selfcheck(events, "/p/marker.txt"))
+        self.assertIn("inconclusive", self.selfcheck(self.stream()[:1], "/p/marker.txt"))
+
     def test_parses_findings_and_verdicts(self):
         header, findings = tools.parse_review(self.review)
         self.assertEqual(header["Head"], f"`{HEAD}`")
