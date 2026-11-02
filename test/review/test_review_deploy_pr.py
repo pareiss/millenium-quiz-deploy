@@ -183,6 +183,50 @@ class ReviewDeployPrTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertFalse(os.path.exists(os.path.join(self.repo, "reviews", "pr-feature.md")))
 
+    def test_committed_symlinks_are_never_followed_and_the_real_secrets_survive(self):
+        # the owner's decrypted secrets, as in the main checkout
+        real = os.path.join(self.repo, "overlays", "local", "secrets.env")
+        self.write("overlays/local/secrets.env", "TOKEN=REAL-SECRET\n")
+        os.symlink(os.path.join(self.repo, "overlays", "local"), os.path.join(self.repo, "overlays", "evil"))
+        # relative variant, as a PR would commit it
+        os.symlink("../../../../overlays/local", os.path.join(self.repo, "overlays", "evil2"))
+        os.makedirs(os.path.join(self.repo, "overlays", "other"))
+        self.write("overlays/other/kustomization.yaml", KUSTOMIZATION.format(tag="1.0"))
+        os.symlink(real, os.path.join(self.repo, "overlays", "other", "secrets.env"))
+        os.symlink(real, os.path.join(self.repo, "overlays", "other", "secrets.env.example"))
+        self.git("add", "-A")
+        self.git("add", "-f", "overlays/other/secrets.env")
+        self.commit("symlinks")
+        done = self.review()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        with open(real) as f:
+            self.assertEqual(f.read(), "TOKEN=REAL-SECRET\n")
+        checks = self.material("checks.md")
+        self.assertIn("overlays/evil", checks)
+        self.assertIn("removed from the review checkout", checks)
+        self.assertFalse(os.path.exists(os.path.join(self.log, "review-material", "rendered", "head", "evil.yaml")))
+        self.assertNotIn("REAL-SECRET", checks)
+        with open(os.path.join(self.log, "checkout.txt")) as f:
+            self.assertNotIn("evil", f.read())
+
+    def test_review_material_a_pr_committed_is_cleared(self):
+        self.write(".review/rendered/head/fake.yaml", "kind: Fake\n")
+        self.write(".review/checks.md", "all good\n")
+        self.git("add", "-A")
+        self.commit("sneak")
+        done = self.review()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.log, "review-material", "rendered", "head", "fake.yaml")))
+        checks = self.material("checks.md")
+        self.assertNotIn("all good", checks)
+        self.assertNotIn("fake.yaml", checks)
+        self.assertIn("commits files under .review/", checks)
+
+    def test_the_checkouts_are_outside_the_main_checkout(self):
+        done = self.review()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
     def make_worktree(self):
         wt = os.path.join(self.tmp.name, "wt")
         self.git("worktree", "add", "-q", "--detach", wt, "feature")

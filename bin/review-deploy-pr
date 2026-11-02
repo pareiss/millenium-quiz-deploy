@@ -118,21 +118,40 @@ if [[ "${REVIEW_SELFCHECKED:-}" != 1 ]]; then
   bin/review-selfcheck || { echo "review-deploy-pr: reviewer isolation not verified, not reviewing" >&2; exit 1; }
 fi
 
-worktree="$root/.claude/worktrees/pr-${slug}-$$"
-base_worktree="$root/.claude/worktrees/prbase-${slug}-$$"
+# The throwaway checkouts live in a fresh directory OUTSIDE this checkout: the
+# PR is unread at this point, and a relative symlink in it must not be able to
+# reach the owner's files (the decrypted overlays/*/secrets.env of this
+# checkout) from there. Nothing in this script writes, deletes or reads
+# through a path the PR controls: symlinks are removed from the checkouts
+# before anything is rendered (see drop_symlinks).
+wtroot="$(mktemp -d)"
+worktree="$wtroot/pr"
+base_worktree="$wtroot/base"
 tmp="$(mktemp)"
 run="$(mktemp)"
 cleanup() {
   git worktree remove --force "$worktree" >/dev/null 2>&1 || true
   git worktree remove --force "$base_worktree" >/dev/null 2>&1 || true
+  rm -rf "$wtroot"
+  git worktree prune >/dev/null 2>&1 || true
   rm -f "$tmp" "$run"
 }
 trap cleanup EXIT
 
-git worktree add --quiet --detach "$worktree" "$head"
+# Deletes every symlink of a checkout (never following one) and prints their
+# paths. A PR's symlink can point anywhere; the reviewer and kustomize get
+# none. The symlinks themselves stay visible in the diff.
+drop_symlinks() { # <worktree>
+  (cd "$1" && find . -type l -print -delete)
+}
 
-# The review material, so the reviewer needs no shell or network.
+git worktree add --quiet --detach "$worktree" "$head"
+head_symlinks="$(drop_symlinks "$worktree")"
+
+# The review material, so the reviewer needs no shell or network. A PR may
+# have committed files under .review/ that would pass as this script's output.
 material="$worktree/.review"
+rm -rf "$material"
 mkdir -p "$material"
 cp REVIEWING.md "$material/REVIEWING.md"
 git log --reverse --format='%h %s%n%n%b' "$base..$head" >"$material/commits.txt"
@@ -160,13 +179,16 @@ fi
 # stand-in (placeholder values; real secrets are never read). Rendered Secret
 # documents are dropped anyway.
 render_all() { # <worktree> <outdir>: writes <outdir>/<overlay>.yaml or .error
-  local wt="$1" out="$2" dir name
+  local wt="$1" out="$2" dir name placeholders=() p
   mkdir -p "$out"
   for dir in "$wt"/base "$wt"/overlays/*/; do
-    [[ -f "$dir/kustomization.yaml" ]] || continue
     dir="${dir%/}"; name="$(basename "$dir")"
-    if [[ -f "$dir/secrets.env.example" && ! -f "$dir/secrets.env" ]]; then
+    # symlinks were removed already; refuse them again where a path is written
+    [[ -L "$dir" || -L "$dir/secrets.env" || -L "$dir/secrets.env.example" ]] && continue
+    [[ -f "$dir/kustomization.yaml" ]] || continue
+    if [[ -f "$dir/secrets.env.example" && ! -e "$dir/secrets.env" ]]; then
       cp "$dir/secrets.env.example" "$dir/secrets.env"
+      placeholders+=("$dir/secrets.env")
     fi
     if "${kust[@]}" "$dir" >"$out/$name.raw" 2>"$out/$name.error"; then
       bin/review-tools strip-secrets <"$out/$name.raw" >"$out/$name.yaml"
@@ -176,7 +198,8 @@ render_all() { # <worktree> <outdir>: writes <outdir>/<overlay>.yaml or .error
     fi
     rm -f "$out/$name.raw"
   done
-  rm -f "$wt"/overlays/*/secrets.env # the placeholder copies must not stay in the reviewer's checkout
+  # only the placeholder copies made above must not stay in the reviewer's checkout
+  for p in ${placeholders[@]+"${placeholders[@]}"}; do rm -f "$p"; done
 }
 
 kust=()
@@ -194,6 +217,15 @@ elif command -v kustomize >/dev/null; then kust=(kustomize build); fi
   if [[ -z "$leaks" ]]; then echo "No suspicious additions found (a cheap pattern check, not proof)."
   else echo "Possible credentials in added lines (values not shown; look at the diff):"; echo; sed 's/^/- /' <<<"$leaks"; fi
   echo
+  echo "## Symlinks and .review/"
+  echo
+  if [[ -z "$head_symlinks" ]]; then echo "No symlinks in the head commit."
+  else echo "The head commit contains symlinks; they were removed from the review checkout and never followed (look at them in the diff):"; echo; sed 's/^/- /' <<<"$head_symlinks"; fi
+  if [[ -n "$(git ls-tree -r --name-only "$head" .review 2>/dev/null)" ]]; then
+    echo
+    echo "The PR commits files under .review/. They were removed; everything in .review/ now is this script's output."
+  fi
+  echo
   echo "## kustomize build"
   echo
   if [[ ${#kust[@]} -eq 0 ]]; then
@@ -201,6 +233,7 @@ elif command -v kustomize >/dev/null; then kust=(kustomize build); fi
   else
     render_all "$worktree" "$material/rendered/head"
     git worktree add --quiet --detach "$base_worktree" "$base"
+    drop_symlinks "$base_worktree" >/dev/null
     render_all "$base_worktree" "$material/rendered/base"
     for f in "$material"/rendered/head/*.yaml "$material"/rendered/head/*.error; do
       [[ -e "$f" ]] || continue

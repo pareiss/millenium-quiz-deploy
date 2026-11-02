@@ -10,3 +10,6 @@ overlays/*/postgres.env
 
 # Python bytecode from the review helper tests
 __pycache__/
+
+# review material of the last bin/review-deploy-pr run
+/.review/
