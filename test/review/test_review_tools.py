@@ -105,6 +105,13 @@ class ReviewToolsTest(unittest.TestCase):
     def test_selfcheck_passes_when_outside_access_was_attempted_and_denied(self):
         self.assertIsNone(self.selfcheck(self.stream(), "/p/marker.txt"))
 
+    def test_selfcheck_ignores_events_whose_message_is_text(self):
+        # The real stream has events with a plain-string message and string blocks.
+        events = self.stream()
+        events[1:1] = [{"type": "system", "subtype": "notice", "message": "retrying"},
+                       {"type": "assistant", "message": {"content": ["plain text block"]}}]
+        self.assertIsNone(self.selfcheck(events, "/p/marker.txt"))
+
     def test_selfcheck_fails_when_outside_access_was_never_attempted(self):
         self.assertIn("never attempted", self.selfcheck(self.stream(attempt=False), "/p/marker.txt"))
 

@@ -129,10 +129,13 @@ def selfcheck(stream_path, inside, outside, context, *outside_paths):
 
     uses, results = {}, {}
     for e in events:
-        content = (e.get("message") or {}).get("content")
+        message = e.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
         for block in content:
+            if not isinstance(block, dict):
+                continue
             if block.get("type") == "tool_use":
                 uses[block.get("id")] = json.dumps(block.get("input", {}))
             elif block.get("type") == "tool_result":
