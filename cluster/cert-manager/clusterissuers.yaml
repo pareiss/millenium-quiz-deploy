@@ -1,0 +1,42 @@
+# Let's Encrypt issuers for cert-manager (cluster-wide, applied once):
+#
+#   kubectl apply -f cluster/cert-manager/clusterissuers.yaml
+#
+# Replace the e-mail address first: Let's Encrypt sends expiry warnings and
+# account notices there. Try new domains with `letsencrypt-staging` (untrusted
+# certificates, generous rate limits), then switch the Ingress annotation to
+# `letsencrypt-prod`.
+#
+# HTTP-01 needs the domain to resolve to this cluster and port 80 to be
+# reachable from the internet: cert-manager starts a short-lived solver pod and
+# Ingress at /.well-known/acme-challenge/ on k3s' Traefik. Without a public
+# port 80, use a DNS-01 solver for your DNS provider instead.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik

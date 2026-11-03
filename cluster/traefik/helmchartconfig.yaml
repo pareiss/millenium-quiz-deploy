@@ -1,0 +1,33 @@
+# WARNING: opt-in, manual, and it can OVERWRITE an existing Traefik config.
+# k3s reads exactly one HelmChartConfig named `traefik` in `kube-system`; if
+# one exists (yours, or k3s' own file /var/lib/rancher/k3s/server/manifests/
+# traefik-config.yaml, which k3s re-applies), this file replaces its whole
+# `valuesContent`. Check first, and only then apply, see README "The client
+# address and `TRUSTED_PROXY_HOPS`":
+#
+#   kubectl -n kube-system get helmchartconfig traefik -o yaml   # exists? merge by hand
+#   kubectl diff -f cluster/traefik/helmchartconfig.yaml
+#   kubectl apply --server-side -f cluster/traefik/helmchartconfig.yaml
+#
+# Keeps the visitor's address visible to Traefik on k3s.
+#
+# k3s deploys Traefik from a bundled Helm chart behind its ServiceLB. With the
+# Service default `externalTrafficPolicy: Cluster` the source address of a
+# request can be replaced by a node or load balancer address (SNAT), and then
+# overlays/production's TRUSTED_PROXY_HOPS=1 would make the app rate-limit all
+# visitors as one client. `Local` preserves the source address. k3s merges this
+# into its bundled chart's values and restarts Traefik (a few seconds of
+# downtime for every site behind it, local included).
+#
+# Skip this file if the check in README "The client address and
+# `TRUSTED_PROXY_HOPS`" already shows your own address; this is what to apply when it does not.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    service:
+      spec:
+        externalTrafficPolicy: Local
