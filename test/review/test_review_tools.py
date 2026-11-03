@@ -257,7 +257,7 @@ class ReviewToolsTest(unittest.TestCase):
         # a real-looking value in test/review/ is still reported
         self.assertEqual(self.scan(f"+++ b/test/review/test_x.py\n+k = '{age_real}'\n"),
                          ["test/review/test_x.py: age private key"])
-        self.assertEqual(self.scan("+++ b/test/review/test_x.py\n+  DB_PASSWORD: Xk9fQ2mZ7pLw\n"),
+        self.assertEqual(self.scan("+++ b/test/review/test_x.py\n+  DB_PASSWORD: " + "Xk9fQ2" + "mZ7pLw" + "\n"),
                          ["test/review/test_x.py: assigned password/secret/key"])
         self.assertEqual(self.scan("+++ b/test/review/test_x.py\n+t = 'ghp_" + "a1B2c3D4e5" * 4 + "'\n"),
                          ["test/review/test_x.py: GitHub token"])

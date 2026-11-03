@@ -141,7 +141,7 @@ class ReviewDeployPrTest(unittest.TestCase):
 
         with open(os.path.join(self.log, "gh.log")) as f:
             self.assertTrue(all(l.startswith("GH_REPO=me/deploy-repo ") for l in f.read().splitlines()))
-        with open(os.path.join(self.repo, "reviews", "pr-feature.md")) as f:
+        with open(os.path.join(self.repo, "reviews", "pr-7-feature.md")) as f:
             review = f.read()
         self.assertIn("- Reviewer: claude-opus-4-7", review)
         self.assertIn("- Written with: sonnet", review)
@@ -253,7 +253,7 @@ exec "$@"
         self.commit("change\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>")
         done = self.review(model="claude-sonnet-5-5")
         self.assertEqual(done.returncode, 1)
-        self.assertFalse(os.path.exists(os.path.join(self.repo, "reviews", "pr-feature.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "reviews", "pr-7-feature.md")))
 
     def test_committed_symlinks_are_never_followed_and_the_real_secrets_survive(self):
         # the owner's decrypted secrets, as in the main checkout
@@ -356,7 +356,7 @@ exec "$@"
         wt = self.make_worktree()
         done = self.review(cwd=wt)
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-        self.assertTrue(os.path.exists(os.path.join(self.repo, "reviews", "pr-feature.md")))
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "reviews", "pr-7-feature.md")))
         self.assertFalse(os.path.exists(os.path.join(wt, "reviews")))
 
 
@@ -411,7 +411,7 @@ class ReviewPostTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def post(self, claim, *flags):
-        with open(os.path.join(self.repo, "reviews", "pr-feature.md"), "w") as f:
+        with open(os.path.join(self.repo, "reviews", "pr-7-feature.md"), "w") as f:
             f.write(REVIEW_FOR_POST.format(head="a" * 40, claim=claim))
         env = dict(os.environ, PATH=self.fakebin + os.pathsep + os.environ["PATH"], FAKE_LOG=self.log)
         return subprocess.run(["bin/review-post", "7", *flags], cwd=self.repo, env=env, capture_output=True, text=True)

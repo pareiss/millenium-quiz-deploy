@@ -30,8 +30,8 @@ if ! python3 -c 'import yaml' 2>/dev/null; then
   cat >&2 <<MSG
 self-check failed: python3 ($(command -v python3)) has no PyYAML, which the manifest checks need.
 Without it every overlay is refused and the reviewer gets no rendered diff. Fix one of:
-  /home/authority/sandbox/.venv/bin/pip install pyyaml   (then run the scripts with that venv's bin first in PATH)
-  sudo apt install python3-yaml                          (system python)
+  pip install pyyaml          (into the python3 that is first in PATH, e.g. a venv)
+  sudo apt install python3-yaml   (system python)
 MSG
   exit 1
 fi

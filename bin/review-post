@@ -6,7 +6,7 @@
 #
 #   bin/review-post <number> [review file] [--dry-run] [--confirm-unreviewed] [--allow-secret-hits]
 #
-# The review file defaults to the PR's current review, reviews/pr-<branch>.md,
+# The review file defaults to the PR's current review, reviews/pr-<number>-<branch>.md,
 # or for a merged/closed PR its newest archived one.
 #
 # - If the PR has commits after the review that name no finding (changes the
@@ -51,8 +51,8 @@ reviews="$(bin/review-dir)"
 branch="$(gh pr view "$number" --json headRefName --jq .headRefName)"
 slug="$(printf '%s' "$branch" | sed 's/[^A-Za-z0-9._-]/-/g')"
 if [[ -z "$file" ]]; then
-  file="$reviews/pr-${slug}.md"
-  [[ -e "$file" ]] || file="$(ls -t "$reviews"/archive/pr-"${slug}"-[0-9a-f]*.md 2>/dev/null | head -1 || true)"
+  file="$reviews/pr-${number}-${slug}.md"
+  [[ -e "$file" ]] || file="$(ls -t "$reviews"/archive/pr-"${number}"-*.md 2>/dev/null | head -1 || true)"
 fi
 [[ -n "$file" && -e "$file" ]] || { echo "review-post: no review found for PR #$number" >&2; exit 1; }
 grep -q "^- PR: #${number} " "$file" || { echo "review-post: $file is not a review of PR #$number" >&2; exit 1; }

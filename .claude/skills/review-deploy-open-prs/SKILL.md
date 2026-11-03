@@ -19,7 +19,7 @@ closed (`bin/review-cleanup`); mention which ones it moved.
 
 When it is done, show the summary table the script printed. For each review
 file, quote the first sentence of its "## Summary" section. For a failed PR,
-show the last lines of its log, `logs/pr-<branch>.log` under the directory `bin/review-dir` prints (the main checkout's `reviews/`, also from a worktree) (the branch
+show the last lines of its log, `logs/pr-<number>-<branch>.log` under the directory `bin/review-dir` prints (the main checkout's `reviews/`, also from a worktree) (the branch
 name with `/` and other special characters replaced by `-`).
 
 Do not judge, fix or post the findings. The user evaluates them in the files

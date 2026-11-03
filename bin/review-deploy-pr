@@ -33,7 +33,7 @@
 # if it is installed. Afterwards every cited path:line is checked against the
 # head commit.
 #
-# Output: reviews/pr-<branch>.md, one current review per PR (the branch name
+# Output: reviews/pr-<number>-<branch>.md, one current review per PR (the branch name
 # with characters other than letters, digits, ".", "_" and "-" replaced by "-").
 # A new review moves the previous one, with its verdicts, to reviews/archive/.
 # Exit codes: 0 reviewed, 3 skipped (the current review is of this commit), 1 failed.
@@ -83,7 +83,7 @@ IFS=$'\t' read -r head base_tip base_branch branch draft url title <<<"$pr"
 short="${head:0:7}"
 slug="$(printf '%s' "$branch" | sed 's/[^A-Za-z0-9._-]/-/g')"
 mkdir -p "$reviews"
-out="$reviews/pr-${slug}.md"
+out="$reviews/pr-${number}-${slug}.md"
 reviewed_head() { sed -n 's/^- Head: `\([0-9a-f]*\)`.*/\1/p' "$1" | head -1; }
 
 if [[ -e "$out" && "$force" != true && "$(reviewed_head "$out")" == "$head" ]]; then
@@ -352,7 +352,7 @@ done
 # Keep the previous review (and the verdicts ticked in it) in the archive.
 if [[ -e "$out" ]]; then
   mkdir -p "$reviews/archive"
-  old="$reviews/archive/pr-${slug}-$(reviewed_head "$out" | cut -c1-7).md"
+  old="$reviews/archive/pr-${number}-${slug}-$(reviewed_head "$out" | cut -c1-7).md"
   [[ -e "$old" ]] && old="${old%.md}-$(date -u +%Y%m%dT%H%M%S).md"
   mv "$out" "$old"
 fi

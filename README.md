@@ -124,7 +124,7 @@ the conversation in which the change was written. The entry point is
 quiz repo's script, so the two are never mixed up.
 
 ```sh
-bin/review-deploy-pr 12          # one PR -> reviews/pr-<branch>.md
+bin/review-deploy-pr 12          # one PR -> reviews/pr-<number>-<branch>.md
 bin/review-deploy-open-prs       # every open PR, one process each, 3 at a time
 REVIEW_MODEL=fable bin/review-deploy-pr 12 --force   # another model, review again
 bin/review-selfcheck --force     # re-verify the isolation
@@ -168,7 +168,7 @@ and offline itself, *before* the reviewer starts, and puts the output into
 
 `cluster/` holds plain manifests and is only read, not rendered.
 
-There is **one current review per PR**, `reviews/pr-<branch>.md` (gitignored);
+There is **one current review per PR**, `reviews/pr-<number>-<branch>.md` (gitignored);
 the reviews directory is always `reviews/` of the **main checkout**, even when
 you run a command from a worktree (`bin/review-dir` prints it), so reviews do
 not vanish with a worktree;
@@ -187,9 +187,8 @@ go into "Decisions and known false positives" in `REVIEWING.md`.
 
 The reviewer is defined in `.claude/agents/pr-reviewer.md`. The scripts need
 `gh`, `claude`, `git`, `python3` and, for the manifest checks, `kubectl` or
-`kustomize` and the Python module PyYAML (`pip install pyyaml` into the shared
-venv `/home/authority/sandbox/.venv`, which must then be first in `PATH`, or
-`sudo apt install python3-yaml` for the system python). Without PyYAML the
+`kustomize` and the Python module PyYAML (`pip install pyyaml` into the python3 that is first in
+`PATH`, e.g. a venv, or `sudo apt install python3-yaml` for the system python). Without PyYAML the
 kustomization path check fails closed: every overlay is refused and nothing is
 rendered; `bin/review-selfcheck` (run by `bin/review-deploy-pr`) stops with
 this hint. `bwrap` (bubblewrap) is recommended: kustomize then runs without

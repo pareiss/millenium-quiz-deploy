@@ -6,7 +6,7 @@
 #
 # PRs whose head commit already has a review are skipped unless --force.
 # Reviews of PRs that are merged or closed are archived first (bin/review-cleanup).
-# Logs of each run: reviews/logs/pr-<branch>.log
+# Logs of each run: reviews/logs/pr-<number>-<branch>.log
 set -euo pipefail
 
 jobs=3
@@ -54,7 +54,7 @@ status_dir="$(mktemp -d)"
 trap 'rm -rf "$status_dir"' EXIT
 
 run() {
-  local n="$1" log="$reviews/logs/pr-${slug[$1]}.log" code=0
+  local n="$1" log="$reviews/logs/pr-$1-${slug[$1]}.log" code=0
   bin/review-deploy-pr "$n" "${force[@]}" >"$log" 2>&1 || code=$?
   echo "$code" >"$status_dir/$n"
   case "$code" in
@@ -75,7 +75,7 @@ printf '%-5s %-9s %-8s %-10s %-4s %-8s %-10s %s\n' PR status blocker should-fix 
 failed=0
 for n in "${numbers[@]}"; do
   code="$(cat "$status_dir/$n" 2>/dev/null || echo 1)"
-  file="$reviews/pr-${slug[$n]}.md"
+  file="$reviews/pr-${n}-${slug[$n]}.md"
   [[ -e "$file" ]] || file=""
   case "$code" in
     0) status=reviewed ;;
