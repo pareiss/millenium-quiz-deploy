@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Reviews every open pull request, each in its own isolated Claude Code
+# process (see bin/review-deploy-pr), a few at a time.
+#
+#   bin/review-deploy-open-prs [--force] [--jobs N]
+#
+# PRs whose head commit already has a review are skipped unless --force.
+# Reviews of PRs that are merged or closed are archived first (bin/review-cleanup).
+# Logs of each run: reviews/logs/pr-<number>-<branch>.log
+set -euo pipefail
+
+jobs=3
+force=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) force=(--force); shift ;;
+    --jobs) jobs="${2:?--jobs needs a number}"; shift 2 ;;
+    *) echo "usage: bin/review-deploy-open-prs [--force] [--jobs N]" >&2; exit 1 ;;
+  esac
+done
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+# gh may only talk to this repository (the origin remote).
+GH_REPO="$(bin/review-tools repo)"
+export GH_REPO
+reviews="$(bin/review-dir)"
+mkdir -p "$reviews/logs"
+
+bin/review-cleanup
+export REVIEW_CLEANED=1
+
+declare -A slug=()
+numbers=()
+while IFS=$'\t' read -r n branch; do
+  numbers+=("$n")
+  slug[$n]="$(printf '%s' "$branch" | sed 's/[^A-Za-z0-9._-]/-/g')"
+done < <(gh pr list --state open --limit 100 --json number,headRefName \
+  --jq '.[] | "\(.number)\t\(.headRefName)"' | sort -n)
+if [[ ${#numbers[@]} -eq 0 ]]; then
+  echo "no open pull requests"
+  exit 0
+fi
+
+# Fetch once up front so the parallel runs don't fight over git locks, and
+# verify the reviewer isolation once instead of in every run.
+git fetch --quiet origin
+bin/review-selfcheck || { echo "reviewer isolation not verified, not reviewing" >&2; exit 1; }
+export REVIEW_SELFCHECKED=1
+
+echo "reviewing ${#numbers[@]} open PR(s): ${numbers[*]/#/#} (up to $jobs at a time)"
+
+status_dir="$(mktemp -d)"
+trap 'rm -rf "$status_dir"' EXIT
+
+run() {
+  local n="$1" log="$reviews/logs/pr-$1-${slug[$1]}.log" code=0
+  bin/review-deploy-pr "$n" "${force[@]}" >"$log" 2>&1 || code=$?
+  echo "$code" >"$status_dir/$n"
+  case "$code" in
+    0) echo "  #$n reviewed" ;;
+    3) echo "  #$n skipped (already reviewed)" ;;
+    *) echo "  #$n FAILED, see $log" ;;
+  esac
+}
+
+for n in "${numbers[@]}"; do
+  while [[ $(jobs -rp | wc -l) -ge $jobs ]]; do wait -n || true; done
+  run "$n" &
+done
+wait
+
+echo
+printf '%-5s %-9s %-8s %-10s %-4s %-8s %-10s %s\n' PR status blocker should-fix nit question CI file
+failed=0
+for n in "${numbers[@]}"; do
+  code="$(cat "$status_dir/$n" 2>/dev/null || echo 1)"
+  file="$reviews/pr-${n}-${slug[$n]}.md"
+  [[ -e "$file" ]] || file=""
+  case "$code" in
+    0) status=reviewed ;;
+    3) status=skipped ;;
+    *) status=failed; failed=$((failed + 1)) ;;
+  esac
+  count() {
+    if [[ -n "$file" ]]; then grep -cE "^### F[0-9]+ · $1 " "$file" || true; else echo -; fi
+  }
+  ci="-"
+  [[ -n "$file" ]] && ci="$(sed -n 's/^- CI: \([a-z]*\).*/\1/p' "$file" | head -1)"
+  printf '%-5s %-9s %-8s %-10s %-4s %-8s %-10s %s\n' "#$n" "$status" \
+    "$(count blocker)" "$(count should-fix)" "$(count nit)" "$(count question)" "${ci:--}" "${file:--}"
+done
+
+[[ $failed -eq 0 ]]

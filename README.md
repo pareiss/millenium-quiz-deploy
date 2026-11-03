@@ -113,3 +113,93 @@ database, change the password with `ALTER USER` first.
 - **Registry:** replace the `ctr import` step with CI pushing to GHCR, and point `images:` at `ghcr.io/<you>/millennium-quiz`.
 - **Backups:** the Postgres data lives on a k3s `local-path` volume on the node. Add a CronJob running `pg_dump` before relying on it.
 - **Yu-Gi-Oh! extras:** a card image cache (PVC or object storage) and an EDOPro/ygopro-core engine container would be added here as extra resources.
+
+## Reviewing pull requests
+
+Pull requests are reviewed by a separate Claude Code process that only knows
+the repository: the PR, the manifests at its head commit, what they render to,
+and the written docs (`REVIEWING.md`, this README, `AGENTS.md`). It never sees
+the conversation in which the change was written. The entry point is
+`bin/review-deploy-pr`; it is deliberately not called `review-pr`, which is the
+quiz repo's script, so the two are never mixed up.
+
+```sh
+bin/review-deploy-pr 12          # one PR -> reviews/pr-<number>-<branch>.md
+bin/review-deploy-open-prs       # every open PR, one process each, 3 at a time
+REVIEW_MODEL=fable bin/review-deploy-pr 12 --force   # another model, review again
+bin/review-selfcheck --force     # re-verify the isolation
+bin/review-post 12 --dry-run     # preview the evaluated review as a PR comment
+bin/review-cleanup               # archive reviews of merged or closed PRs
+bin/review-dir                   # print the reviews directory (main checkout)
+```
+
+Guarantees, each checked by the scripts rather than promised:
+
+- **Another model.** The reviewer's model family must differ from every Claude
+  model in the PR's `Co-Authored-By` trailers; otherwise the review is refused.
+  The model that actually answered is checked again and recorded in the
+  review's header.
+- **Isolation.** The reviewer runs inside a throwaway worktree of the head
+  commit with the flags in `bin/review-flags`: only Read, Grep and Glob (no
+  shell, no Write/Edit, no MCP), confined to that worktree, no settings, no
+  saved session. `bin/review-selfcheck` verifies this with the installed Claude
+  Code (tool list exactly Read, Grep, Glob; a marker file outside the working
+  directory stays unread), before reviewing and after every Claude Code update.
+- **Only this repository.** Every script sets `GH_REPO` from the `origin`
+  remote, so `gh` cannot touch another repository.
+- **Nothing touches a cluster.** The scripts never run `kubectl` against a
+  cluster, only the offline `kubectl kustomize` (or `kustomize build`).
+- **Real locations.** The diff the reviewer gets carries the head commit's line
+  numbers, and every cited `path:line` is checked afterwards; impossible ones
+  get a "Location check" warning in the review.
+
+This repository has **no CI**, so there are no test results to hand over
+(`.review/tests.md` says so). Instead the script runs the checks that are cheap
+and offline itself, *before* the reviewer starts, and puts the output into
+`.review/` so the reviewer needs no shell:
+
+- `checks.md`: a tripwire over the added lines for credentials (names the file,
+  never prints the value); `kubectl kustomize` of `base` and every overlay (the
+  committed `secrets.env.example` stands in for the gitignored `secrets.env`
+  in the throwaway checkout, and rendered `Secret` documents are dropped);
+  images without a tag or with `latest`; `kubeconform` if it is installed.
+- `rendered/head/<overlay>.yaml` and `rendered/diff-<overlay>.patch`: what each
+  overlay renders to, and how that differs from the merge base.
+
+`cluster/` holds plain manifests and is only read, not rendered.
+
+There is **one current review per PR**, `reviews/pr-<number>-<branch>.md` (gitignored);
+the reviews directory is always `reviews/` of the **main checkout**, even when
+you run a command from a worktree (`bin/review-dir` prints it), so reviews do
+not vanish with a worktree;
+its header names the commit it covers. A PR is reviewed again only when it has
+new commits (or with `--force`); the previous review moves to
+`reviews/archive/` with the verdicts you ticked.
+
+In Claude Code the same is available as `/review-deploy-pr <number>` and
+`/review-deploy-open-prs`. Each finding has a "Your verdict" line: tick valid,
+wrong or unsure. `/post-review <number>` (or `bin/review-post <number>`) then
+posts the evaluated review to the PR: every finding with your verdict and
+reason, and the commits after the review that address it. A fix commit names
+its findings at the start of a line of its message, e.g. `- F2: ...` or
+`- F1, F5: ...`. Posting again updates the same comment. Rejected findings can
+go into "Decisions and known false positives" in `REVIEWING.md`.
+
+The reviewer is defined in `.claude/agents/pr-reviewer.md`. The scripts need
+`gh`, `claude`, `git`, `python3` and, for the manifest checks, `kubectl` or
+`kustomize` and the Python module PyYAML (`pip install pyyaml` into the python3 that is first in
+`PATH`, e.g. a venv, or `sudo apt install python3-yaml` for the system python). Without PyYAML the
+kustomization path check fails closed: every overlay is refused and nothing is
+rendered; `bin/review-selfcheck` (run by `bin/review-deploy-pr`) stops with
+this hint. `bwrap` (bubblewrap) is recommended: kustomize then runs without
+network and with the home directory hidden. If bwrap is missing or does not
+work here (the render is probed with the exact command line it will use), the
+script falls back to `unshare` (network cut, filesystem NOT isolated) and, if
+that fails too, to no sandbox at all; `checks.md` states which one was used,
+and only the default load restrictor, no helm/plugins and the path check
+protect the render in the last case. The helper logic is tested without Claude or GitHub (the end-to-end
+test uses a fake `gh` and a fake `claude` in a temporary repository):
+
+```sh
+python3 -m unittest discover -s test/review
+```

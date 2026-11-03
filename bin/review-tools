@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""Helpers for bin/review-deploy-pr and the other review scripts (no dependencies).
+
+  review-tools annotate-diff < diff               diff with head line numbers
+  review-tools authors <base> <head>              Claude model families that co-authored the commits
+  review-tools family <model>                     model family of a model name or alias
+  review-tools run-result <json> <text-out>       review text of a `claude -p --output-format json` run;
+                                                  prints the models that answered, one per line
+  review-tools check-locations <review> <head>    flags cited path:line that don't exist at head
+  review-tools selfcheck <stream-json> <inside-token> <outside-token> <context-token> <outside-path>...
+  review-tools post-body <review> <pr-commits.json> <evaluator>
+                                                  PR comment with every finding, its verdict and
+                                                  the commits that address it
+  review-tools since-review <review> <pr-commits.json>
+                                                  commits after the review that name no finding
+  review-tools mark-posted <review> <timestamp> <url>
+                                                  add or replace the review's "- Posted:" line
+  review-tools repo [<remote-url>]                OWNER/REPO of origin, the only repository gh may be used on
+  review-tools scan-secrets < diff                added lines/files that look like committed credentials
+                                                  (names the file and kind, never prints the value)
+  review-tools image-lint < yaml                  images in rendered output without a tag/digest or with :latest
+  review-tools strip-secrets < yaml               drops Secret documents from rendered kustomize output
+  review-tools check-kustomizations <checkout>    refusals, one "<dir>\t<reason>" per line, for every kustomization in
+                                                  the checkout that reaches outside it (absolute or escaping ".." paths,
+                                                  remote refs, helm charts) or that references a refused directory
+"""
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+
+FAMILIES = ("opus", "sonnet", "haiku", "fable")
+
+
+def family(model):
+    name = model.lower()
+    return next((f for f in FAMILIES if f in name), name)
+
+
+def annotate_diff():
+    """Prefix every line of each hunk with its line number in the new file, so
+    the reviewer can cite real lines instead of positions in the patch."""
+    new = None
+    for line in sys.stdin:
+        line = line.rstrip("\n")
+        hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if hunk:
+            new = int(hunk.group(1))
+            print(line)
+        elif new is not None and line[:1] in ("+", " "):
+            print(f"{new:>6} |{line}")
+            new += 1
+        elif new is not None and line[:1] in ("-", "\\"):
+            print(f"{'':>6} |{line}")
+        else:
+            new = None
+            print(line)
+
+
+def authors(base, head):
+    log = subprocess.run(
+        ["git", "log", "--format=%B", f"{base}..{head}"], capture_output=True, text=True, check=True
+    ).stdout
+    found = {family(m) for m in re.findall(r"(?im)^co-authored-by:\s*claude\s+(\w+)", log)}
+    print(" ".join(sorted(found)))
+
+
+def run_result(json_path, text_out):
+    with open(json_path) as f:
+        data = json.load(f)
+    if data.get("is_error") or not data.get("result"):
+        sys.exit(f"reviewer run failed: {data.get('subtype') or data.get('result') or 'no result'}")
+    with open(text_out, "w") as f:
+        f.write(data["result"])
+    for model in data.get("modelUsage", {}):
+        print(model)
+
+
+def check_locations(review_path, head):
+    """Adds a warning line under every finding whose path:line doesn't exist at head."""
+    heading = re.compile(r"^### (F\d+) · [^·]+ · (\S+?):~?(\d+)")
+    lines_cache = {}
+
+    def file_lines(path):
+        if path not in lines_cache:
+            show = subprocess.run(["git", "show", f"{head}:{path}"], capture_output=True, text=True)
+            lines_cache[path] = show.stdout.count("\n") if show.returncode == 0 else None
+        return lines_cache[path]
+
+    out, bad = [], 0
+    with open(review_path) as f:
+        for line in f:
+            out.append(line)
+            m = heading.match(line)
+            if not m:
+                continue
+            path, number = m.group(2), int(m.group(3))
+            total = file_lines(path)
+            problem = None
+            if total is None:
+                problem = f"`{path}` does not exist at the head commit"
+            elif number > total:
+                problem = f"`{path}` has only {total} lines at the head commit"
+            if problem:
+                bad += 1
+                out.append(f"- **Location check:** ⚠ {problem}; the location is probably wrong.\n")
+    with open(review_path, "w") as f:
+        f.writelines(out)
+    print(bad)
+
+
+def selfcheck(stream_path, inside, outside, context, *outside_paths):
+    """Passes only if the session had exactly Read, Grep and Glob, read the inside
+    file, ATTEMPTED every given outside path and was denied each time (a tool_use
+    naming it, answered by an error tool_result), and neither the outside token
+    nor the token of the context files in the parent directory got in."""
+    with open(stream_path) as f:
+        raw = f.read()
+    events = [json.loads(l) for l in raw.splitlines() if l.strip().startswith("{")]
+    init = next((e for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
+    problems = []
+    if init is None:
+        problems.append("no init event in the output")
+    elif sorted(init.get("tools", [])) != ["Glob", "Grep", "Read"]:
+        problems.append(f"available tools are {sorted(init.get('tools', []))}, expected Glob, Grep, Read")
+    if inside not in raw:
+        problems.append("the file inside the working directory was not read (inconclusive run)")
+    if outside in raw:
+        problems.append("a file OUTSIDE the working directory was read")
+    if context in raw:
+        problems.append("a context file (CLAUDE.md/AGENTS.md) of a PARENT directory was loaded")
+
+    uses, results = {}, {}
+    for e in events:
+        message = e.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                uses[block.get("id")] = json.dumps(block.get("input", {}))
+            elif block.get("type") == "tool_result":
+                results[block.get("tool_use_id")] = bool(block.get("is_error"))
+    for path in outside_paths:
+        ids = [i for i, inp in uses.items() if json.dumps(path)[1:-1] in inp]
+        if not ids:
+            problems.append(f"access to {path} was never attempted (inconclusive run)")
+        elif not all(results.get(i) for i in ids):
+            problems.append(f"access to {path} was attempted but not denied with an error")
+    if problems:
+        sys.exit("self-check failed: " + "; ".join(problems))
+    print("self-check passed: tools are Read, Grep, Glob only; inside read; outside and parent context attempted and denied")
+
+
+def parse_review(path):
+    """Header fields and findings (with the human verdict) of a review file."""
+    with open(path) as f:
+        text = f.read()
+    header = dict(re.findall(r"(?m)^- (PR|Branch|Base|Head|Reviewer|CI|Date|Posted): (.*)$", text))
+    findings = []
+    for block in re.split(r"(?m)^(?=### F\d+ · )", text)[1:]:
+        block = re.split(r"(?m)^## ", block)[0]
+        head = re.match(r"### (F\d+) · ([^·]+?) · (.+?) — (.*)", block)
+        if not head:
+            continue
+        field = lambda name: (re.search(rf"(?ms)^- \*\*{name}:\*\* (.*?)(?=^- \*\*|\Z)", block) or [None, ""])[1].strip()
+        verdict_line = field("Your verdict")
+        marked = re.findall(r"\[[xX]\] (valid|wrong|unsure)", verdict_line)
+        reason = verdict_line.split("reason:", 1)[1].strip() if "reason:" in verdict_line else ""
+        findings.append({
+            "id": head.group(1), "severity": head.group(2).strip(),
+            "location": head.group(3).strip(), "title": head.group(4).strip(),
+            "claim": field("Claim"), "evidence": field("Evidence"),
+            "fix": field("Suggested fix"), "confidence": field("Confidence"),
+            "verdict": marked[0] if marked else "unmarked", "reason": reason,
+        })
+    return header, findings
+
+
+# A commit addresses a finding when a line of its message starts with the
+# finding's id, e.g. "F2: ..." or "- F1, F5: ..." (the convention for review
+# fix commits). A mere mention ("F2 is a false positive") doesn't count.
+FIX_LINE = re.compile(r"(?m)^[ \t]*(?:[-*][ \t]+)?(F\d+(?:[ \t]*,[ \t]*F\d+)*)[ \t]*:")
+
+
+def commits_after_review(commits_path, reviewed_head, reviewed_at):
+    """The PR's own commits (GitHub's list, oldest first) made after the
+    reviewed commit: those following it in the list, or, if a rebase removed
+    it from the PR, those committed after the review's date."""
+    with open(commits_path) as f:
+        commits = json.load(f).get("commits", [])
+    oids = [c["oid"] for c in commits]
+    if reviewed_head in oids:
+        return commits[oids.index(reviewed_head) + 1 :]
+    return [c for c in commits if not reviewed_at or c.get("committedDate", "") > reviewed_at]
+
+
+def named_findings(commit):
+    message = (commit.get("messageHeadline") or "") + "\n" + (commit.get("messageBody") or "")
+    return {fid for group in FIX_LINE.findall(message) for fid in re.findall(r"F\d+", group)}
+
+
+def fixing_commits(commits):
+    """Finding id -> short shas of the commits that address it."""
+    found = {}
+    for c in commits:
+        for fid in sorted(named_findings(c), key=lambda f: int(f[1:])):
+            found.setdefault(fid, []).append(c["oid"][:7])
+    return found
+
+
+def review_point(header):
+    head = re.search(r"[0-9a-f]{40}", header.get("Head", ""))
+    # Review dates look like 2026-10-03T02:15Z; GitHub's like 2026-10-03T02:20:11Z.
+    date = header.get("Date", "").strip()
+    if re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\dZ", date):
+        date = date.replace("Z", ":00Z")
+    return (head.group(0) if head else ""), date
+
+
+def since_review(review_path, commits_path):
+    """Prints the commits after the review that name no finding: changes the
+    review never saw, so the user should confirm before posting."""
+    header, _ = parse_review(review_path)
+    for c in commits_after_review(commits_path, *review_point(header)):
+        if not named_findings(c):
+            print(f"{c['oid'][:7]} {c.get('messageHeadline', '')}")
+
+
+def mark_posted(review_path, timestamp, url):
+    """Adds the "- Posted:" line after "- Date:", or replaces an existing one."""
+    with open(review_path) as f:
+        lines = f.read().split("\n")
+    line = f"- Posted: {timestamp} {url}"
+    posted = [i for i, l in enumerate(lines) if l.startswith("- Posted: ")]
+    if posted:
+        lines[posted[0]] = line
+    else:
+        date = next((i for i, l in enumerate(lines) if l.startswith("- Date: ")), 0)
+        lines.insert(date + 1, line)
+    with open(review_path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def post_body(review_path, commits_path, evaluator):
+    header, findings = parse_review(review_path)
+    reviewed, reviewed_at = review_point(header)
+    fixes = fixing_commits(commits_after_review(commits_path, reviewed, reviewed_at))
+    icon = {"valid": "✅ valid", "wrong": "❌ wrong", "unsure": "🤷 unsure", "unmarked": "– not evaluated"}
+    cell = lambda t: t.replace("|", "\\|").replace("\n", " ")
+
+    out = [
+        "## Review, evaluated",
+        "",
+        f"Independent review of `{reviewed[:7]}` by {header.get('Reviewer', 'the reviewer').split(' (')[0]}"
+        f" (`bin/review-deploy-pr`, no shared context with the author). CI at review time: {header.get('CI', 'unknown')}.",
+        f"Each finding was judged by @{evaluator}; \"Addressed in\" lists the commits after the review that name the finding.",
+        "",
+        "| # | Severity | Finding | Verdict | Reason | Addressed in |",
+        "|---|---|---|---|---|---|",
+    ]
+    for f in findings:
+        addressed = ", ".join(fixes.get(f["id"], [])) or ("–" if f["verdict"] != "valid" else "not yet")
+        out.append(
+            f"| {f['id']} | {f['severity']} | {cell(f['title'])} | {icon[f['verdict']]} | {cell(f['reason']) or '–'} | {addressed} |"
+        )
+    out += ["", "<details><summary>Findings in full</summary>", ""]
+    for f in findings:
+        out += [
+            f"#### {f['id']} · {f['severity']} · `{f['location']}` — {f['title']}",
+            "",
+            f"- **Claim:** {f['claim']}",
+            f"- **Evidence:** {f['evidence']}",
+            f"- **Suggested fix:** {f['fix']}",
+            f"- **Confidence:** {f['confidence']}",
+            f"- **Verdict:** {icon[f['verdict']]}" + (f" — {f['reason']}" if f["reason"] else ""),
+            "",
+        ]
+    out += ["</details>"]
+    print("\n".join(out))
+
+
+def repo(url=None):
+    """OWNER/REPO of the `origin` remote (or of the given URL). The scripts export
+    it as GH_REPO so `gh` can only ever talk to this repository."""
+    if url is None:
+        url = subprocess.run(
+            ["git", "remote", "get-url", "origin"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    m = re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", url)
+    if not m:
+        sys.exit(f"cannot find a GitHub OWNER/REPO in the origin URL: {url}")
+    print(f"{m.group(1)}/{m.group(2)}")
+
+
+# (kind, regex over an added line). Values are never printed.
+SECRET_LINE_PATTERNS = [
+    ("age private key", re.compile(r"AGE-SECRET-KEY-1[0-9A-Z]{20,}")),
+    ("private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")),
+    ("registry/basic-auth credentials in a URL", re.compile(r"://[^/\s:@]+:[^/\s@]{4,}@")),
+    ("base64 .dockerconfigjson / kubeconfig token", re.compile(r"(?i)(\.dockerconfigjson|client-key-data|token):\s*[A-Za-z0-9+/=]{40,}")),
+    ("assigned password/secret/key", re.compile(r"(?i)\b(\w*(?:password|passwd|secret|api_?key|cookie)\w*)\s*[:=]\s*[\"']?([^\s\"'#]{8,})")),
+]
+# Values that are plainly placeholders, and SOPS output, are fine.
+PLACEHOLDER = re.compile(r"(?i)change-?me|example|placeholder|<[^>]+>|\$\(|\$\{|secretKeyRef|^ENC\[|^\.\.\.$|^xxx+$")
+PLAINTEXT_FILES = re.compile(r"(^|/)(secrets\.env|postgres\.env|keys\.txt|kubeconfig|[^/]*\.(pem|key)|id_(rsa|ed25519))$|(^|/)\.kube/config$")
+
+
+# Allowlist for the scanner's own test fixtures (test/review/ holds deliberately
+# fake credentials that would otherwise be reported on every review that touches
+# it). Narrow on purpose: a hit is allowlisted only if ALL hold:
+#   - the file is under FIXTURE_PATH_GLOB (fnmatch, "*" also crosses "/"),
+#   - its kind is in FIXTURE_KINDS,
+#   - the value is obviously fake: it contains FAKE_MARKER (dummy, fake, fixture,
+#     not-real), or it is an age key whose body is one repeated character.
+# Allowlisted hits are NOT dropped: they are printed as "allowlisted fixture: ..."
+# lines (bin/review-deploy-pr lists them separately in checks.md). Anything else,
+# including a real-looking secret in test/review/, is reported as before.
+FIXTURE_PATH_GLOB = "test/review/*"
+FIXTURE_KINDS = {"age private key", "registry/basic-auth credentials in a URL", "assigned password/secret/key"}
+FAKE_MARKER = re.compile(r"(?i)dummy|fake|fixture|not-?real")
+
+
+def obviously_fake(kind, value):
+    if kind == "age private key":
+        body = value[len("AGE-SECRET-KEY-1"):]
+        return len(set(body)) == 1
+    return bool(FAKE_MARKER.search(value))
+
+
+def is_allowlisted_fixture(path, kind, value):
+    return (fnmatch.fnmatchcase(path, FIXTURE_PATH_GLOB) and kind in FIXTURE_KINDS
+            and obviously_fake(kind, value))
+
+
+def scan_secrets(text=None):
+    """Reads a unified diff on stdin; prints one line per suspicious addition.
+    Prints nothing when clean. This is a cheap tripwire, not a scanner: the
+    reviewer still reads the diff. Known fake test fixtures (see the allowlist
+    above) are printed as "allowlisted fixture: <path>: <kind>"."""
+    text = sys.stdin.read() if text is None else text
+    path, hits = "?", []
+    for line in text.splitlines():
+        if line.startswith("+++ "):
+            path = line[4:].removeprefix("b/")
+            if PLAINTEXT_FILES.search(path):
+                hits.append(f"{path}: file name is one that holds plaintext credentials")
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        added = line[1:]
+        if path.endswith(".enc.env"):
+            # SOPS-encrypted values are ENC[...]; a plaintext line in an .enc.env is flagged.
+            # Only here may comment lines be skipped.
+            if not added.startswith(("sops_", "#")) and "ENC[" not in added and "=" in added:
+                hits.append(f"{path}: line not encrypted by SOPS (no ENC[...])")
+            continue
+        # A credential committed as a comment is still committed: scan the text after the "#".
+        added = re.sub(r"^\s*(#+\s*)+", "", added)
+        for kind, rx in SECRET_LINE_PATTERNS:
+            m = rx.search(added)
+            if not m:
+                continue
+            value = m.group(2) if kind == "assigned password/secret/key" else m.group(0)
+            # Placeholders are judged on the matched value only, so a real secret
+            # on a line that also says "example" is still reported.
+            if PLACEHOLDER.search(value):
+                continue
+            if kind == "assigned password/secret/key" and m.group(1).lower().endswith(("name", "ref", "path", "file")):
+                continue
+            if is_allowlisted_fixture(path, kind, value):
+                hits.append(f"allowlisted fixture: {path}: {kind}")
+            else:
+                hits.append(f"{path}: {kind}")
+            break
+    for h in dict.fromkeys(hits):
+        print(h)
+
+
+def image_lint(text=None):
+    """Prints every `image:` in rendered manifests that is not pinned: no tag
+    and no digest, or the tag `latest`."""
+    text = sys.stdin.read() if text is None else text
+    for m in re.finditer(r"(?m)^\s*-?\s*image:\s*[\"']?([^\s\"']+)", text):
+        image = m.group(1)
+        if "@sha256:" in image:
+            continue
+        last = image.rsplit("/", 1)[-1]
+        if ":" not in last:
+            print(f"{image}: no tag")
+        elif last.endswith(":latest"):
+            print(f"{image}: tag latest")
+
+
+KUSTOMIZATION_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
+# Fields whose entries are paths (a file or a directory) kustomize loads.
+PATH_LIST_FIELDS = ("resources", "components", "bases", "crds", "configurations", "generators",
+                    "transformers", "validators", "patchesStrategicMerge")
+REMOTE_REF = re.compile(
+    r"://|^[\w.-]+@[\w.-]+:|^git::|^(?:github|gitlab|bitbucket)\.[a-z]+[/:]|\.git(?://|\?|$)", re.I)
+HOST_LIKE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
+
+
+def _path_problem(root, kdir, value):
+    """Why kustomize must not be asked to load this path, or None. `root` is
+    the real path of the checkout, `kdir` the directory of the kustomization."""
+    if not isinstance(value, str) or not value.strip():
+        return "entry is not a path string" if not isinstance(value, str) else None
+    if REMOTE_REF.search(value):
+        return f"remote reference `{value}`"
+    if os.path.isabs(value) or value.startswith(("~", "\\")) or re.match(r"^[A-Za-z]:[\\/]", value):
+        return f"absolute path `{value}`"
+    first = value.split("/", 1)[0]
+    if "/" in value and HOST_LIKE.match(first) and not os.path.exists(os.path.join(kdir, first)):
+        return f"looks like a remote reference `{value}`"
+    target = os.path.realpath(os.path.join(kdir, value))
+    if target != root and not target.startswith(root + os.sep):
+        return f"path `{value}` resolves outside the checkout"
+    return None
+
+
+def _paths_of(doc):
+    """(field, value) for every path-like entry of a parsed kustomization."""
+    def entries(field):
+        v = doc.get(field)
+        return v if isinstance(v, list) else ([] if v is None else [v])
+    for field in PATH_LIST_FIELDS:
+        for v in entries(field):
+            # patchesStrategicMerge entries may be inline YAML (multi-line)
+            if field == "patchesStrategicMerge" and isinstance(v, str) and "\n" in v:
+                continue
+            yield field, v
+    for field in ("patches", "patchesJson6902"):
+        for v in entries(field):
+            if isinstance(v, dict) and v.get("path") is not None:
+                yield f"{field}.path", v["path"]
+    for v in entries("replacements"):
+        if isinstance(v, dict) and v.get("path") is not None:
+            yield "replacements.path", v["path"]
+    if isinstance(doc.get("openapi"), dict) and doc["openapi"].get("path") is not None:
+        yield "openapi.path", doc["openapi"]["path"]
+    for gen in ("configMapGenerator", "secretGenerator"):
+        for g in entries(gen):
+            if not isinstance(g, dict):
+                continue
+            for env in ([g["env"]] if "env" in g else []) + (g.get("envs") or []):
+                yield f"{gen}.envs", env
+            for f in g.get("files") or []:
+                yield f"{gen}.files", f
+                if isinstance(f, str) and "=" in f:
+                    yield f"{gen}.files", f.split("=", 1)[1]
+    for h in entries("helmCharts") + entries("helmGlobals"):
+        yield "helm", None  # handled by the caller
+
+
+def check_kustomizations(checkout):
+    """Prints "<dir relative to the checkout>\t<reason>" for every kustomization
+    that must not be rendered: one with an absolute path, a ".." path leaving
+    the checkout, a remote reference (git, URL), a helm chart, or one that
+    cannot be parsed; and every kustomization that references such a directory.
+    Fail closed: without PyYAML nothing can be verified, so everything is refused."""
+    root = os.path.realpath(checkout)
+    kfiles = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        kfiles += [os.path.join(base, n) for n in KUSTOMIZATION_NAMES if n in files]
+    problems, deps = {}, {}
+    rel = lambda d: os.path.relpath(d, root)
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    for kfile in sorted(kfiles):
+        kdir = os.path.dirname(kfile)
+        mine = problems.setdefault(rel(kdir), [])
+        name = os.path.basename(kfile)
+        if yaml is None:
+            mine.append(f"{name}: cannot be checked (python3 PyYAML is not installed)")
+            continue
+        try:
+            with open(kfile) as f:
+                doc = yaml.safe_load(f)
+        except Exception as e:  # noqa: BLE001 - any parse failure means "cannot verify"
+            mine.append(f"{name}: cannot be parsed ({type(e).__name__})")
+            continue
+        if doc is None:
+            continue
+        if not isinstance(doc, dict):
+            mine.append(f"{name}: not a mapping")
+            continue
+        for field, value in _paths_of(doc):
+            if field == "helm":
+                mine.append(f"{name}: helmCharts need helm, which is never run here")
+                continue
+            why = _path_problem(root, kdir, value)
+            if why:
+                mine.append(f"{name}: {field}: {why}")
+            elif field in ("resources", "components", "bases") and isinstance(value, str):
+                target = os.path.realpath(os.path.join(kdir, value))
+                if os.path.isdir(target):
+                    deps.setdefault(rel(kdir), set()).add(rel(target))
+    # a directory is refused too when anything it loads is refused
+    changed = True
+    while changed:
+        changed = False
+        for d, targets in deps.items():
+            for t in sorted(targets):
+                if problems.get(t) and not any(x.startswith(f"references refused `{t}`") for x in problems[d]):
+                    problems[d].append(f"references refused `{t}`")
+                    changed = True
+    for d, reasons in sorted(problems.items()):
+        for r in reasons:
+            print(f"{d}\t{r}")
+
+
+def strip_secrets(text=None):
+    """Removes `kind: Secret` documents from rendered kustomize output, so
+    generated secrets never land in the review material.
+
+    Limit: this only recognises `kind: Secret`. A ConfigMap (or any other
+    kind) that a kustomization filled with secret values, e.g. through a
+    `replacements:` entry, is NOT dropped. What keeps real secrets out is that
+    the render only ever sees placeholder files (secrets.env.example) and that
+    check-kustomizations refuses kustomizations reaching outside the checkout."""
+    text = sys.stdin.read() if text is None else text
+    docs = re.split(r"(?m)^---\s*$", text)
+    kept = [d for d in docs if not re.search(r"(?m)^kind:\s*Secret\s*$", d)]
+    print("---".join(kept).strip("\n"))
+
+
+if __name__ == "__main__":
+    cmd, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("", [])
+    commands = {
+        "annotate-diff": annotate_diff,
+        "authors": authors,
+        "family": lambda m: print(family(m)),
+        "run-result": run_result,
+        "check-locations": check_locations,
+        "selfcheck": selfcheck,
+        "post-body": post_body,
+        "since-review": since_review,
+        "mark-posted": mark_posted,
+        "repo": repo,
+        "scan-secrets": scan_secrets,
+        "strip-secrets": strip_secrets,
+        "check-kustomizations": check_kustomizations,
+        "image-lint": image_lint,
+    }
+    if cmd not in commands:
+        sys.exit(__doc__)
+    commands[cmd](*args)

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Posts an evaluated review to its pull request as a comment, so the PR shows
+# why changes were made: every finding with the verdict and reason given to it,
+# and the commits after the review that address it (commits with a line like
+# "F2: ..." or "- F1, F5: ...").
+#
+#   bin/review-post <number> [review file] [--dry-run] [--confirm-unreviewed] [--allow-secret-hits]
+#
+# The review file defaults to the PR's current review, reviews/pr-<number>-<branch>.md,
+# or for a merged/closed PR its newest archived one.
+#
+# - If the PR has commits after the review that name no finding (changes the
+#   review never saw), it prints them and only posts with --confirm-unreviewed.
+# - Posting a review that was posted before updates that comment instead of
+#   adding a second one (the link is in the review's "- Posted:" line).
+# - The comment text goes through the secret tripwire (bin/review-tools
+#   scan-secrets) first; on a hit nothing is posted unless --allow-secret-hits.
+# - --dry-run prints the comment (and any warning) without posting.
+set -euo pipefail
+
+usage() { echo "usage: bin/review-post <number> [review file] [--dry-run] [--confirm-unreviewed] [--allow-secret-hits]" >&2; exit 1; }
+
+number=""
+file=""
+dry_run=false
+confirm_unreviewed=false
+allow_secrets=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry_run=true ;;
+    --confirm-unreviewed) confirm_unreviewed=true ;;
+    --allow-secret-hits) allow_secrets=true ;;
+    -*) usage ;;
+    *)
+      if [[ -z "$number" && "$arg" =~ ^[0-9]+$ ]]; then number="$arg"
+      elif [[ -z "$file" ]]; then file="$arg"
+      else usage
+      fi
+      ;;
+  esac
+done
+[[ -n "$number" ]] || usage
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+# gh may only talk to this repository (the origin remote).
+GH_REPO="$(bin/review-tools repo)"
+export GH_REPO
+reviews="$(bin/review-dir)"
+
+branch="$(gh pr view "$number" --json headRefName --jq .headRefName)"
+slug="$(printf '%s' "$branch" | sed 's/[^A-Za-z0-9._-]/-/g')"
+if [[ -z "$file" ]]; then
+  file="$reviews/pr-${number}-${slug}.md"
+  [[ -e "$file" ]] || file="$(ls -t "$reviews"/archive/pr-"${number}"-*.md 2>/dev/null | head -1 || true)"
+fi
+[[ -n "$file" && -e "$file" ]] || { echo "review-post: no review found for PR #$number" >&2; exit 1; }
+grep -q "^- PR: #${number} " "$file" || { echo "review-post: $file is not a review of PR #$number" >&2; exit 1; }
+
+if ! grep -qE '\[[xX]\] (valid|wrong|unsure)' "$file"; then
+  echo "review-post: no finding in $file has a verdict yet; tick valid, wrong or unsure first" >&2
+  exit 1
+fi
+
+commits="$(mktemp)"
+body="$(mktemp)"
+trap 'rm -f "$commits" "$body"' EXIT
+gh pr view "$number" --json commits >"$commits"
+bin/review-tools post-body "$file" "$commits" "$(gh api user --jq .login)" >"$body"
+
+# The comment is public: a quoted credential must not go out with it. Values
+# are never printed, only the kind of hit.
+secret_hits="$({ echo "+++ b/the-comment"; sed 's/^/+/' "$body"; } | bin/review-tools scan-secrets)"
+if [[ -n "$secret_hits" ]]; then
+  {
+    echo "review-post: the comment text looks like it contains a credential:"
+    sed 's/^/  /' <<<"$secret_hits"
+    echo "Edit the review file ($file) to remove it."
+  } >&2
+fi
+
+unreviewed="$(bin/review-tools since-review "$file" "$commits")"
+if [[ -n "$unreviewed" ]]; then
+  {
+    echo "review-post: PR #$number changed after the review in commits that address no finding:"
+    sed 's/^/  /' <<<"$unreviewed"
+    echo "The review didn't see these changes; its line numbers and evidence may be outdated."
+  } >&2
+fi
+
+previous="$(sed -n 's/^- Posted: .*issuecomment-\([0-9]*\).*/\1/p' "$file" | head -1)"
+
+if [[ "$dry_run" == true ]]; then
+  cat "$body"
+  [[ -n "$previous" ]] && echo "(would update the comment posted before: issuecomment-$previous)" >&2
+  exit 0
+fi
+
+if [[ -n "$secret_hits" && "$allow_secrets" != true ]]; then
+  echo "review-post: not posted; run again with --allow-secret-hits if this is a false positive" >&2
+  exit 1
+fi
+
+if [[ -n "$unreviewed" && "$confirm_unreviewed" != true ]]; then
+  echo "review-post: not posted; run again with --confirm-unreviewed to post anyway" >&2
+  exit 1
+fi
+
+if [[ -n "$previous" ]]; then
+  url="$(gh api -X PATCH "repos/$GH_REPO/issues/comments/$previous" -F "body=@$body" --jq .html_url)"
+  verb=updated
+else
+  url="$(gh pr comment "$number" --body-file "$body")"
+  verb=posted
+fi
+bin/review-tools mark-posted "$file" "$(date -u +%Y-%m-%dT%H:%MZ)" "$url"
+echo "$verb: $url"
