@@ -1,0 +1,15 @@
+# Dump target. A PVC of its own, not the database volume: a full or damaged
+# data volume must not take the dumps with it. On k3s `local-path` this is a
+# directory on the same node, so it protects against mistakes and corruption,
+# not against losing the node or its disk (README "Backups").
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi

@@ -12,6 +12,8 @@ resources:
   - namespace.yaml
   - postgres/service.yaml
   - postgres/statefulset.yaml
+  - backup/pvc.yaml
+  - backup/cronjob.yaml
   - app/configmap.yaml
   - app/service.yaml
   - app/service-headless.yaml

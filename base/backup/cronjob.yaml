@@ -1,0 +1,92 @@
+# Daily pg_dump of the app database into the `postgres-backup` PVC, keeping the
+# newest KEEP dumps. Restore: README "Backups".
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+spec:
+  schedule: "17 3 * * *" # 03:17 UTC; overlays patch it
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgres-backup
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999 # "postgres" in the image, like the StatefulSet
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-dump
+              # same image as the StatefulSet: pg_dump must not be older than the server
+              image: docker.io/library/postgres:17
+              command:
+                - bash
+                - -euo
+                - pipefail
+                - -c
+                - |
+                  # custom format: compressed, checked with pg_restore --list,
+                  # restorable selectively with pg_restore
+                  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+                  file="/backup/${PGDATABASE}-${stamp}.dump"
+                  trap 'rm -f "${file}.partial"' EXIT
+                  pg_dump --format=custom --file="${file}.partial"
+                  pg_restore --list "${file}.partial" > /dev/null
+                  mv "${file}.partial" "${file}"
+                  echo "wrote ${file} ($(stat -c %s "${file}") bytes)"
+                  # retention: only after a good dump, so a failing job never
+                  # deletes the last good one. Names sort by time.
+                  ls -1 /backup/"${PGDATABASE}"-*.dump | sort -r | tail -n +"$((KEEP + 1))" | xargs -r rm -v --
+                  ls -l /backup
+              env:
+                - name: PGHOST
+                  value: postgres
+                - name: PGUSER
+                  value: millennium_quiz
+                - name: PGDATABASE
+                  value: millennium_quiz
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres
+                      key: POSTGRES_PASSWORD
+                # number of dumps to keep (days, with the daily schedule).
+                # Keep this the 5th env entry: overlays/production patches env/4.
+                - name: KEEP
+                  value: "7"
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+                - name: tmp
+                  mountPath: /tmp
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  memory: 256Mi
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: postgres-backup
+            - name: tmp
+              emptyDir: {}
