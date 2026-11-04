@@ -80,8 +80,9 @@ patches:
           - hosts:
               - quiz.example.com # <- your domain
             secretName: millennium-quiz-tls
-  # Backups (README "Backups"): base is daily 03:17 UTC, 2Gi, dumps are never
-  # deleted automatically. To change the schedule, add a patch:
+  # Backups (README "Backups"): base is daily 03:17 UTC, 2Gi. Dumps older than
+  # RETENTION_DAYS (30) are deleted, the newest MIN_KEEP (7) never; both are env
+  # vars of the CronJob in base/backup/cronjob.yaml. To change the schedule, add a patch:
   # - target: {kind: CronJob, name: postgres-backup}
   #   patch: |-
   #     - op: replace
