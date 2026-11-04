@@ -80,25 +80,20 @@ patches:
           - hosts:
               - quiz.example.com # <- your domain
             secretName: millennium-quiz-tls
-  # Backups (README "Backups"): base is daily 03:17 UTC, 7 dumps, 2Gi.
-  - target:
-      kind: CronJob
-      name: postgres-backup
-    patch: |-
-      - op: replace
-        path: /spec/schedule
-        value: "17 3 * * *" # <- cron, UTC
-      # dumps to keep (see the PVC size below)
-      - op: replace
-        path: /spec/jobTemplate/spec/template/spec/containers/0/env/4/value
-        value: "14"
+  # Backups (README "Backups"): base is daily 03:17 UTC, 2Gi, dumps are never
+  # deleted automatically. To change the schedule, add a patch:
+  # - target: {kind: CronJob, name: postgres-backup}
+  #   patch: |-
+  #     - op: replace
+  #       path: /spec/schedule
+  #       value: "17 3 * * *" # <- cron, UTC
   - target:
       kind: PersistentVolumeClaim
       name: postgres-backup
     patch: |-
       - op: replace
         path: /spec/resources/requests/storage
-        value: 5Gi # <- >= KEEP x the size of one dump, with room to grow
+        value: 5Gi # <- a label on local-path (not enforced); on other storage >= the dumps you keep, with room to grow
       # Default StorageClass (k3s: local-path) unless you name one:
       # - op: add
       #   path: /spec/storageClassName

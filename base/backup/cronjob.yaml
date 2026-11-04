@@ -1,5 +1,7 @@
-# Daily pg_dump of the app database into the `postgres-backup` PVC, keeping the
-# newest KEEP dumps. Restore: README "Backups".
+# Daily pg_dump of the app database into the `postgres-backup` PVC. Nothing is
+# ever deleted here: a corrupt database can still be dumped, so a new dump must
+# not push out an older good one. Prune by hand (README "Backups").
+# Restore: README "Backups".
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -39,19 +41,37 @@ spec:
                 - pipefail
                 - -c
                 - |
+                  # MOCK of a Discord notification: only writes the message to the
+                  # job log (`kubectl logs`). When a webhook exists, replace the
+                  # body with a POST of {"content": "$1"} to it (the postgres image
+                  # has no curl: use a small image with curl for this step).
+                  notify() { echo "[discord mock] postgres-backup: $1"; }
+                  file=
+                  on_exit() {
+                    rc=$?
+                    if [ -n "$file" ]; then rm -f "${file}.partial"; fi
+                    if [ "$rc" -ne 0 ]; then notify "FAILED (exit $rc), the newest dump may be old"; fi
+                    exit "$rc"
+                  }
+                  trap on_exit EXIT
+
                   # custom format: compressed, checked with pg_restore --list,
                   # restorable selectively with pg_restore
                   stamp=$(date -u +%Y%m%dT%H%M%SZ)
                   file="/backup/${PGDATABASE}-${stamp}.dump"
-                  trap 'rm -f "${file}.partial"' EXIT
                   pg_dump --format=custom --file="${file}.partial"
                   pg_restore --list "${file}.partial" > /dev/null
                   mv "${file}.partial" "${file}"
                   echo "wrote ${file} ($(stat -c %s "${file}") bytes)"
-                  # retention: only after a good dump, so a failing job never
-                  # deletes the last good one. Names sort by time.
-                  ls -1 /backup/"${PGDATABASE}"-*.dump | sort -r | tail -n +"$((KEEP + 1))" | xargs -r rm -v --
                   ls -l /backup
+
+                  # no automatic deletion; tell the owner when the volume fills up
+                  used=$(df --output=pcent /backup | tail -n 1 | tr -dc 0-9)
+                  count=$(ls -1 /backup/"${PGDATABASE}"-*.dump | wc -l)
+                  notify "ok, wrote $(basename "${file}"), ${count} dumps, volume ${used}% full"
+                  if [ "$used" -ge "$WARN_PERCENT" ]; then
+                    notify "WARNING: backup volume ${used}% full, prune old dumps by hand"
+                  fi
               env:
                 - name: PGHOST
                   value: postgres
@@ -64,10 +84,9 @@ spec:
                     secretKeyRef:
                       name: postgres
                       key: POSTGRES_PASSWORD
-                # number of dumps to keep (days, with the daily schedule).
-                # Keep this the 5th env entry: overlays/production patches env/4.
-                - name: KEEP
-                  value: "7"
+                # the notification warns when the backup volume is this full (%)
+                - name: WARN_PERCENT
+                  value: "80"
               volumeMounts:
                 - name: backup
                   mountPath: /backup

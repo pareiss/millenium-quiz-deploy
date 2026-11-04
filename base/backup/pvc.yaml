@@ -1,7 +1,9 @@
-# Dump target. A PVC of its own, not the database volume: a full or damaged
-# data volume must not take the dumps with it. On k3s `local-path` this is a
-# directory on the same node, so it protects against mistakes and corruption,
-# not against losing the node or its disk (README "Backups").
+# Dump target. A PVC of its own, so a damaged database volume does not take the
+# dumps with it. On k3s `local-path` it is only a directory on the same node,
+# on the same disk as the database, and `requests.storage` is NOT enforced: the
+# size below is a label, not a limit. Dumps can fill the disk the database lives
+# on, so watch the free space and prune by hand, or use a StorageClass on other
+# storage (README "Backups").
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
