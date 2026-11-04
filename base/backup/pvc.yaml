@@ -1,0 +1,17 @@
+# Dump target. A PVC of its own, so a damaged database volume does not take the
+# dumps with it. On k3s `local-path` it is only a directory on the same node,
+# on the same disk as the database, and `requests.storage` is NOT enforced: the
+# size below is a label, not a limit. Dumps can fill the disk the database lives
+# on, so watch the free space and prune by hand, or use a StorageClass on other
+# storage (README "Backups").
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi

@@ -8,6 +8,7 @@ The application code lives in its own repository; this repo only decides
 base/                       environment-independent resources
   namespace.yaml            namespace millennium-quiz
   postgres/                 StatefulSet (postgres:17, 2Gi PVC) + headless Service
+  backup/                   CronJob (daily pg_dump) + its own PVC, see "Backups"
   app/deployment.yaml       Phoenix release, 1 replica
                             initContainer `migrate`: migrations + first admin
                             probes: /healthz/live (startup, liveness), /healthz/ready (DB)
@@ -321,6 +322,174 @@ kubectl -n millennium-quiz-production describe certificate millennium-quiz-tls
 (The app logs to stdout; there are no log files. A restore's result from
 `/admin/backup` is also written to the app log.)
 
+## Backups
+
+A CronJob `postgres-backup` (in `base/backup/`, so in both overlays) runs
+`pg_dump --format=custom` every day at 03:17 UTC against the `postgres` Service,
+with the password from the existing `postgres` Secret (no new secret values).
+It uses the same `postgres:17` image as the StatefulSet, checks the dump with
+`pg_restore --list`, writes `millennium_quiz-<UTC timestamp>.dump` to the
+separate PVC `postgres-backup` (not the database volume). Retention: after a
+dump that passed `pg_restore --list`, dumps older than `RETENTION_DAYS` (30) are
+deleted, but the newest `MIN_KEEP` (7) never are: a corrupt database can still be
+dumped, so a run of bad dumps must not push out every good one. Pruning more
+or earlier is by hand (below). The schedule has `timeZone: Etc/UTC`, so 03:17 is
+UTC whatever the node's zone. The custom format is
+compressed and restorable with `pg_restore`, also table by table; plain SQL
+would be larger and could only be fed to `psql`. `concurrencyPolicy: Forbid`,
+a 30 minute deadline, the last 3 successful and 3 failed Jobs are kept for
+`kubectl logs`. Every run ends with a notification line in the job log
+(`[discord mock] postgres-backup: ok ...`, or `FAILED ...`, or a warning when
+the volume is `WARN_PERCENT` (80) full). It is only a **mock** of a Discord
+message so far: nothing is sent. Hooking up a real webhook is the `notify()`
+function at the top of the script in `base/backup/cronjob.yaml`.
+
+**Nobody sees a failed job by themselves.** Until the notification is real,
+check `kubectl -n $NS get cronjob postgres-backup -o jsonpath='{.status.lastSuccessfulTime}'`
+now and then and before every deploy. If the target is full, every run fails:
+free space by hand (below). With the 30 day limit the volume stays bounded
+by about 30 dumps (one a day), but a failing target never frees anything.
+
+**What is backed up:** the whole database `millennium_quiz` (questions, cards,
+accounts, saved games). **Not** the Secrets (they are in git, encrypted) nor
+anything outside Postgres.
+
+**Does not protect against:** losing the node or its disk. The default k3s
+`local-path` storage puts the database volume *and* the backup volume on the
+same node and the same disk. The PVC guards against a mistake or a corrupted
+database volume, not against hardware, and **not against a full disk**:
+`local-path` does not enforce the PVC's size, so dumps and `PGDATA` share the
+free space, and a disk filled by dumps stops Postgres (about 30 dumps at most
+with the retention above). Check the free space of
+`/var/lib/rancher/k3s/storage` on the node against (dumps you keep) x (size of
+one dump), prune, or put the PVC on other storage with a `storageClassName`. Copy dumps off the node regularly (below),
+and keep them out of git (they contain accounts).
+
+The app's own `/admin/backup` JSON export is a separate, different thing: it
+holds only the quiz content (no games, no extra accounts) and is restored
+through the app, not with `pg_restore`. Both are useful.
+
+Settings: the schedule is `spec.schedule` and the warning level, retention
+days and minimum kept dumps the `WARN_PERCENT`, `RETENTION_DAYS` and `MIN_KEEP`
+env vars in `base/backup/cronjob.yaml`; the PVC size is in
+`pvc.yaml`. `overlays/production` patches the size (5Gi, a label on
+`local-path`) and has commented places for a schedule and a `storageClassName`.
+
+All commands below are examples for the owner; nothing here has been run
+against a cluster. Use `-n millennium-quiz` for local.
+
+```sh
+NS=millennium-quiz-production
+
+# state: schedule, last run, jobs
+kubectl -n $NS get cronjob,job -l app.kubernetes.io/name=postgres-backup
+kubectl -n $NS logs job/<job name>
+
+# run one now (also the "fresh dump first" before a restore or an upgrade)
+kubectl -n $NS create job --from=cronjob/postgres-backup postgres-backup-manual-$(date +%Y%m%d-%H%M)
+kubectl -n $NS wait --for=condition=complete --timeout=10m job/postgres-backup-manual-<...>
+kubectl -n $NS logs job/postgres-backup-manual-<...>   # "wrote ... (N bytes)" and the file list
+```
+
+(Delete a manual Job afterwards with `kubectl -n $NS delete job <name>`.)
+
+### Prune old dumps by hand
+
+Old dumps go by themselves (above); to free space sooner, use the throwaway pod from the next
+section, but with `readOnly: false` on the volume mount, list the dumps and
+delete the old ones (keep the newest ones and at least one you have checked):
+
+```sh
+kubectl -n $NS exec backup-shell -- ls -lh /backup
+kubectl -n $NS exec backup-shell -- rm /backup/millennium_quiz-<timestamp>.dump
+kubectl -n $NS delete pod backup-shell
+```
+
+### Copy a dump off the node
+
+The dumps are in a PVC that no running pod has mounted. Start a throwaway pod
+that does, copy, delete it:
+
+```sh
+kubectl -n $NS apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: backup-shell
+spec:
+  restartPolicy: Never
+  securityContext: {runAsNonRoot: true, runAsUser: 999, runAsGroup: 999, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: shell
+      image: docker.io/library/postgres:17
+      command: ["sleep", "3600"]
+      securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}
+      volumeMounts: [{name: backup, mountPath: /backup, readOnly: true}]
+  volumes:
+    - name: backup
+      persistentVolumeClaim: {claimName: postgres-backup}
+EOF
+kubectl -n $NS wait --for=condition=Ready pod/backup-shell
+kubectl -n $NS exec backup-shell -- ls -l /backup
+kubectl -n $NS cp backup-shell:/backup/millennium_quiz-<timestamp>.dump ./prod-<timestamp>.dump
+ls -l prod-*.dump     # not empty?
+kubectl -n $NS delete pod backup-shell
+```
+
+(The PVC is ReadWriteOnce on a single node, so the pod can share it with a
+running backup Job there; avoid doing it during the 03:17 run anyway.)
+
+### Restore into a fresh database
+
+Restore into a *new* database next to the old one and swap by renaming, so the
+current data is not overwritten until the restored one is checked.
+
+```sh
+# 0. take a fresh dump first (above), copy it off. Pick the dump to restore;
+#    copy it to your machine as restore.dump (see "Copy a dump off the node").
+
+# 1. stop the app (it holds connections and writes); Postgres keeps running.
+#    Suspend the backup CronJob too: a dump running now holds a connection to
+#    the database and would stop the rename in step 4
+kubectl -n $NS scale deploy/millennium-quiz --replicas=0
+kubectl -n $NS patch cronjob postgres-backup -p '{"spec":{"suspend":true}}'
+kubectl -n $NS get job -l app.kubernetes.io/name=postgres-backup   # none may be running
+
+# 2. create an empty database and load the dump into it. The dump has the
+#    owner millennium_quiz, the same user that is restoring.
+kubectl -n $NS exec postgres-0 -- createdb -U millennium_quiz millennium_quiz_restored
+kubectl -n $NS exec -i postgres-0 -- \
+  pg_restore -U millennium_quiz -d millennium_quiz_restored --no-owner --exit-on-error < restore.dump
+
+# 3. check it
+kubectl -n $NS exec postgres-0 -- \
+  psql -U millennium_quiz millennium_quiz_restored -c 'select count(*) from schema_migrations'
+
+# 4. swap: connect to the `postgres` maintenance database, because a database
+#    cannot be renamed while you are connected to it
+kubectl -n $NS exec postgres-0 -- psql -U millennium_quiz postgres \
+  -c 'ALTER DATABASE millennium_quiz RENAME TO millennium_quiz_old' \
+  -c 'ALTER DATABASE millennium_quiz_restored RENAME TO millennium_quiz'
+
+# 5. start the app again; the migrate init container applies migrations that
+#    are newer than the dump
+kubectl -n $NS scale deploy/millennium-quiz --replicas=1
+kubectl -n $NS rollout status deploy/millennium-quiz
+kubectl -n $NS logs deploy/millennium-quiz -c migrate
+kubectl -n $NS patch cronjob postgres-backup -p '{"spec":{"suspend":false}}'   # backups on again
+
+# 6. when everything works, drop the old one (not before)
+kubectl -n $NS exec postgres-0 -- dropdb -U millennium_quiz millennium_quiz_old
+```
+
+If step 4 fails with "being accessed by other users", something is still
+connected: check that the app really is at 0 replicas and that no backup Job is
+running (step 1). Restoring a dump from an
+older app version into a newer app works (migrations run on start); the other
+way round, restore only with the matching older image tag. If the whole volume
+is gone (new node), start with an empty cluster deployment first (the
+`First deployment` steps), then restore as above.
+
 ## Day-to-day (local overlay)
 
 ```sh
@@ -378,7 +547,7 @@ database, change the password with `ALTER USER` first.
 - **Running games across deploys:** each game is snapshotted to Postgres after every move, so a restart only interrupts players for a few seconds.
 - **TLS:** the local overlay uses plain http; `overlays/production` gets its certificate from cert-manager (see "Public deployment with Let's Encrypt") and runs in its own namespace.
 - **Registry:** the app repository's CI already pushes to GHCR (`sha-<7>` tags); `overlays/production` pulls from there, `overlays/local` still uses `ctr import`.
-- **Backups:** the Postgres data lives on a k3s `local-path` volume on the node. Add a CronJob running `pg_dump` before relying on it.
+- **Backups:** done: a daily `pg_dump` CronJob (dumps older than 30 days are deleted, the newest 7 never; the Discord notification is only a mock), see "Backups". It lands on the same node as the database; copying dumps off the node is still manual (an off-site copy, e.g. an object store, would be the next step).
 - **Yu-Gi-Oh! extras:** a card image cache (PVC or object storage) and an EDOPro/ygopro-core engine container would be added here as extra resources.
 
 ## Reviewing pull requests

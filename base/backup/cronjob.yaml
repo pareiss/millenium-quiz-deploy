@@ -1,0 +1,126 @@
+# Daily pg_dump of the app database into the `postgres-backup` PVC. Dumps older
+# than RETENTION_DAYS are deleted after a verified new dump, but the newest
+# MIN_KEEP are never deleted: a corrupt database can still be dumped, so a run
+# of bad dumps must not push out every older good one (README "Backups").
+# Restore: README "Backups".
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+spec:
+  schedule: "17 3 * * *" # 03:17 in timeZone below; overlays patch it
+  timeZone: "Etc/UTC" # without it the node's zone applies (Kubernetes 1.27+)
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgres-backup
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999 # "postgres" in the image, like the StatefulSet
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-dump
+              # same image as the StatefulSet: pg_dump must not be older than the server
+              image: docker.io/library/postgres:17
+              command:
+                - bash
+                - -euo
+                - pipefail
+                - -c
+                - |
+                  # MOCK of a Discord notification: only writes the message to the
+                  # job log (`kubectl logs`). When a webhook exists, replace the
+                  # body with a POST of {"content": "$1"} to it (the postgres image
+                  # has no curl: use a small image with curl for this step).
+                  notify() { echo "[discord mock] postgres-backup: $1"; }
+                  file=
+                  on_exit() {
+                    rc=$?
+                    if [ -n "$file" ]; then rm -f "${file}.partial"; fi
+                    if [ "$rc" -ne 0 ]; then notify "FAILED (exit $rc), the newest dump may be old"; fi
+                    exit "$rc"
+                  }
+                  trap on_exit EXIT
+
+                  # custom format: compressed, checked with pg_restore --list,
+                  # restorable selectively with pg_restore
+                  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+                  file="/backup/${PGDATABASE}-${stamp}.dump"
+                  pg_dump --format=custom --file="${file}.partial"
+                  pg_restore --list "${file}.partial" > /dev/null
+                  mv "${file}.partial" "${file}"
+                  echo "wrote ${file} ($(stat -c %s "${file}") bytes)"
+                  ls -l /backup
+
+                  # retention: only after a verified dump, only dumps older than
+                  # RETENTION_DAYS, never the newest MIN_KEEP. Names sort by time.
+                  ls -1 /backup/"${PGDATABASE}"-*.dump | sort -r | tail -n +"$((MIN_KEEP + 1))" |
+                    while read -r old; do
+                      if [ -n "$(find "$old" -mtime +"$RETENTION_DAYS")" ]; then rm -v -- "$old"; fi
+                    done
+
+                  # tell the owner when the volume fills up
+                  used=$(df --output=pcent /backup | tail -n 1 | tr -dc 0-9)
+                  count=$(ls -1 /backup/"${PGDATABASE}"-*.dump | wc -l)
+                  notify "ok, wrote $(basename "${file}"), ${count} dumps, volume ${used}% full"
+                  if [ "$used" -ge "$WARN_PERCENT" ]; then
+                    notify "WARNING: backup volume ${used}% full, prune old dumps by hand"
+                  fi
+              env:
+                - name: PGHOST
+                  value: postgres
+                - name: PGUSER
+                  value: millennium_quiz
+                - name: PGDATABASE
+                  value: millennium_quiz
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres
+                      key: POSTGRES_PASSWORD
+                # the notification warns when the backup volume is this full (%)
+                - name: WARN_PERCENT
+                  value: "80"
+                # dumps older than this many days are deleted (one month) ...
+                - name: RETENTION_DAYS
+                  value: "30"
+                # ... but this many of the newest are always kept
+                - name: MIN_KEEP
+                  value: "7"
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+                - name: tmp
+                  mountPath: /tmp
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  memory: 256Mi
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: postgres-backup
+            - name: tmp
+              emptyDir: {}

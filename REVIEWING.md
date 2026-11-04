@@ -94,7 +94,7 @@ here (see "Decisions and known false positives" at the end).
 - A change that restarts, recreates or migrates the database or the app needs
   the deploy notes in the PR: **take a backup first** (the app's admin backup
   page, `/admin/backup`, exports the quiz content; games and extra accounts are
-  not in it; or `pg_dump` from `postgres-0`), then deploy, then check
+  not in it; or `pg_dump` from `postgres-0`, or a manual Job from the backup CronJob), then deploy, then check
   `kubectl -n millennium-quiz get pods` and the `migrate` container's logs.
 - **Rollback must be possible and written down**: the previous image tag, and
   for a migration that is not backwards compatible, the backup to restore. A
@@ -170,9 +170,14 @@ again, or when a design decision should stop being questioned.
 - **One app replica with `Recreate`, no PodDisruptionBudget, no autoscaling.**
   Deliberate (see invariants). Don't suggest `RollingUpdate` or more replicas.
 - **Postgres as a StatefulSet in the cluster, not a managed database.**
-  The owner's decision. Backups are manual for now (a CronJob with `pg_dump` is
-  listed under "Notes and next steps" in the README); don't flag the absence of
-  automated backups in a PR that doesn't touch them.
+  The owner's decision. Backups are a daily `pg_dump` CronJob (`base/backup/`,
+  README "Backups") into a PVC on the same node; the off-node copy is manual.
+  Don't flag the absence of an off-site backup in a PR that doesn't touch
+  backups. A PR that does touch them: the image stays the StatefulSet's
+  Postgres version, the credentials come from the `postgres` Secret, the dump
+  PVC stays separate from the database volume, the job deletes only dumps older
+  than `RETENTION_DAYS` and never the newest `MIN_KEEP`, and only after a
+  verified dump, and the README restore steps still match.
 - **The image is imported into k3s by hand (`ctr images import`) for the local
   overlay.** A registry (`ghcr.io/pareiss/millennium-quiz`, built by the app
   repo's CI) is the production plan; the local overlay's `localhost/…` image is
