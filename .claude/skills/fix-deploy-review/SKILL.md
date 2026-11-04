@@ -3,7 +3,7 @@ name: fix-deploy-review
 description: After the user ticked the verdicts of a review of millennium-quiz-deploy (the Kubernetes manifests): post the review, fix the valid findings, push, post again with the fix commits, and say whether another review round is needed.
 argument-hint: <pr-number>
 disable-model-invocation: true
-allowed-tools: Bash, Read, Edit, Write, Grep, Glob
+allowed-tools: Bash(bin/review-post:*), Bash(bin/review-dir:*), Bash(python3 -m unittest:*), Bash(bash -n:*), Bash(kubectl kustomize:*), Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git push:*), Bash(git pull:*), Bash(git worktree:*), Bash(git rev-parse:*), Bash(gh pr view:*), Bash(gh pr edit:*), Bash(sleep:*), Read, Edit, Write, Grep, Glob
 ---
 
 The user ran this command, so that is their go-ahead to post the review and to
@@ -11,9 +11,9 @@ push fix commits to the PR's branch. Nothing else is authorised: do not merge,
 do not start a review (`bin/review-deploy-pr`) yourself, do not touch other PRs.
 It only ever talks to `pareiss/millenium-quiz-deploy`.
 
-1. **Find the review.** The file is `reviews/pr-<number>-<branch>.md` in the main
-   checkout (the first entry of `git worktree list`; gitignored, so it is not in a
-   worktree). Read it. If
+1. **Find the review.** The file is `$(bin/review-dir)/pr-<number>-<branch>.md`
+   (the reviews directory of the main checkout; gitignored, so it is not inside
+   a worktree). Read it. If
    there is none, or no finding has a verdict, stop and say so. If a finding is
    **unsure** or has no verdict, list them and ask the user before going on.
 2. **Post the review first, before any fix commit** (so the PR's history reads
@@ -29,11 +29,18 @@ It only ever talks to `pareiss/millenium-quiz-deploy`.
    finding or an earlier decision, say so instead of guessing). Skip findings
    marked **wrong**. Keep fixes small and inside the PR's scope; when a fix
    makes the PR description, README or docs untrue, change them in the same go.
-4. **Check.** `python3 -m unittest discover -s test/review`; `bash -n` on every shell script you changed (a CronJob script can be extracted from the YAML and run with fake commands); `kubectl kustomize` of base and both overlays when the secret files exist or the `*.example` copies can be used. Nothing is applied to a cluster. Say honestly what was not run.
+   **Some findings cannot be fixed by a commit.** If a valid finding is a
+   committed credential, or needs an action of the owner on the cluster
+   (rotation, `ALTER USER`, a backup first, an apply order), do not report it
+   as fixed by a commit alone: a secret stays in the branch's history until it
+   is rotated. Stop, tell the user what has to happen outside the repo, and
+   leave the finding open in the report (it also means a re-review, step 7).
+4. **Check.** `python3 -m unittest discover -s test/review`; `bash -n` on every shell script you changed (a CronJob script can be extracted from the YAML and run with fake commands); `kubectl kustomize` of base and both overlays when the secret files exist, or after copying `overlays/<name>/secrets.env.example` to `secrets.env` **in the fix worktree only when that `secrets.env` is missing**: never overwrite an existing `secrets.env`, never print it, and delete a copy you made when done. Nothing is applied to a cluster. Say honestly what was not run.
 5. **Commit and push.** One commit, message `Review findings of PR #<n>` plus a
    line `- F<k>: <what changed>` per finding (`bin/review-post` links the commit
    to the findings by these lines), ending with the model trailer
-   `Co-Authored-By: <the model you are>` as in the commits of this PR. Push.
+   `Co-Authored-By: Claude <Model name and version> <noreply@anthropic.com>` (the
+   model you are; the trailer the system prompt names for commits). Push.
 6. **Post again.** GitHub lags: poll `gh pr view <n> --json commits --jq
    '.commits[-1].oid'` (sleep 5, at most a minute) until it matches `git
    rev-parse HEAD`, then `bin/review-post <number>` (it updates the same
@@ -42,7 +49,9 @@ It only ever talks to `pareiss/millenium-quiz-deploy`.
    what it says.
 7. **Is another review round needed?** Decide, with reasons, and do not start
    it. A new round is **recommended** when any of these holds:
-   - a blocker or should-fix was fixed with more than a comment or doc change;
+   - a blocker was fixed, whatever the kind of fix (a doc change for a blocker is
+     safety-relevant text that nobody else has read);
+   - a should-fix was fixed with more than a comment or doc change;
    - the fix changed behaviour, a script, a manifest or a public interface
      beyond the lines the finding cited, or added a file or a setting;
    - a "question" was answered by building something (not only by text);
@@ -51,8 +60,8 @@ It only ever talks to `pareiss/millenium-quiz-deploy`.
      on purpose is only reported;
    - a check in step 4 could not be run.
    It is **not needed** when all fixed findings were nits or docs/comment-only,
-   the diff of the fix commit is limited to the cited places (a should-fix fixed
-   by a comment or doc change counts as docs), and all checks passed. Report: findings fixed / rejected / open, the checks and their
+   the diff of the fix commit is limited to the cited places (a should-fix or nit fixed
+   by a comment or doc change counts as docs; a blocker never does), and all checks passed. Report: findings fixed / rejected / open, the checks and their
    result, the fix commit, the comment's link, and the recommendation with the
    command for the user to run: `bin/review-deploy-pr <number>`.
 8. A rejected finding with a reason that will come up again: propose (do not
