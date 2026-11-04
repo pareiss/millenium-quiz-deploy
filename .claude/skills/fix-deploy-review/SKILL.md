@@ -42,15 +42,17 @@ It only ever talks to `pareiss/millenium-quiz-deploy`.
    what it says.
 7. **Is another review round needed?** Decide, with reasons, and do not start
    it. A new round is **recommended** when any of these holds:
-   - a fixed finding was a blocker or should-fix;
+   - a blocker or should-fix was fixed with more than a comment or doc change;
    - the fix changed behaviour, a script, a manifest or a public interface
      beyond the lines the finding cited, or added a file or a setting;
    - a "question" was answered by building something (not only by text);
-   - a finding is left open (unsure, unfixable here, or contradicting another);
+   - a finding is left open without the owner having deferred it (unsure,
+     unfixable here, or contradicting another); one the owner's reason defers
+     on purpose is only reported;
    - a check in step 4 could not be run.
    It is **not needed** when all fixed findings were nits or docs/comment-only,
-   the diff of the fix commit is limited to the cited places, and all checks
-   passed. Report: findings fixed / rejected / open, the checks and their
+   the diff of the fix commit is limited to the cited places (a should-fix fixed
+   by a comment or doc change counts as docs), and all checks passed. Report: findings fixed / rejected / open, the checks and their
    result, the fix commit, the comment's link, and the recommendation with the
    command for the user to run: `bin/review-deploy-pr <number>`.
 8. A rejected finding with a reason that will come up again: propose (do not
