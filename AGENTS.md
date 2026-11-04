@@ -73,8 +73,11 @@ Read first: `README.md` (layout, first deployment, secrets), then
    docs. Every finding is a claim the owner judges; the review file is
    `reviews/pr-<number>-<branch>.md` in the main checkout (gitignored; `bin/review-dir`
    prints the path, also when you work in a worktree).
-4. The owner ticks "valid", "wrong" or "unsure" in the review file. When the
-   user says the verdicts are marked, first remind them to run
+4. The owner ticks "valid", "wrong" or "unsure" in the review file. The user's
+   command `/fix-deploy-review <PR>` does the whole round: post the review, fix
+   the valid findings, push, post again with the fix commits and say whether
+   another review is needed (it never starts one). Without that command, when
+   the user says the verdicts are marked, first remind them to run
    `/post-review <PR>` (`bin/review-post`), so the PR shows every finding with
    its verdict and reason; then fix the accepted findings in new commits on the
    same branch (message `Review findings of PR #N`, with a line `- F2: …` per
