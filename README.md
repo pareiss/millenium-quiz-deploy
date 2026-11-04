@@ -449,7 +449,11 @@ wrong or unsure. `/post-review <number>` (or `bin/review-post <number>`) then
 posts the evaluated review to the PR: every finding with your verdict and
 reason, and the commits after the review that address it. A fix commit names
 its findings at the start of a line of its message, e.g. `- F2: ...` or
-`- F1, F5: ...`. Posting again updates the same comment. Rejected findings can
+`- F1, F5: ...`. Posting again updates the same comment.
+`/fix-deploy-review <number>` does the whole round after you ticked the
+verdicts: it posts the review, fixes the valid findings, pushes (you confirm the
+push), posts again with the fix commits and says whether another review is
+needed (it never starts one). Rejected findings can
 go into "Decisions and known false positives" in `REVIEWING.md`.
 
 The reviewer is defined in `.claude/agents/pr-reviewer.md`. The scripts need
