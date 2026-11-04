@@ -329,10 +329,12 @@ A CronJob `postgres-backup` (in `base/backup/`, so in both overlays) runs
 with the password from the existing `postgres` Secret (no new secret values).
 It uses the same `postgres:17` image as the StatefulSet, checks the dump with
 `pg_restore --list`, writes `millennium_quiz-<UTC timestamp>.dump` to the
-separate PVC `postgres-backup` (not the database volume). **It never deletes a
-dump**: a corrupt database can still be dumped, so rotating automatically could
-replace the last good dump with a bad one. Pruning is by hand (below). The
-custom format is
+separate PVC `postgres-backup` (not the database volume). Retention: after a
+dump that passed `pg_restore --list`, dumps older than `RETENTION_DAYS` (30) are
+deleted, but the newest `MIN_KEEP` (7) never are: a corrupt database can still be
+dumped, so a run of bad dumps must not push out every good one. Pruning more
+or earlier is by hand (below). The schedule has `timeZone: Etc/UTC`, so 03:17 is
+UTC whatever the node's zone. The custom format is
 compressed and restorable with `pg_restore`, also table by table; plain SQL
 would be larger and could only be fed to `psql`. `concurrencyPolicy: Forbid`,
 a 30 minute deadline, the last 3 successful and 3 failed Jobs are kept for
@@ -345,7 +347,8 @@ function at the top of the script in `base/backup/cronjob.yaml`.
 **Nobody sees a failed job by themselves.** Until the notification is real,
 check `kubectl -n $NS get cronjob postgres-backup -o jsonpath='{.status.lastSuccessfulTime}'`
 now and then and before every deploy. If the target is full, every run fails:
-free space by hand (below).
+free space by hand (below). With the 30 day limit the volume stays bounded
+by about 30 dumps (one a day), but a failing target never frees anything.
 
 **What is backed up:** the whole database `millennium_quiz` (questions, cards,
 accounts, saved games). **Not** the Secrets (they are in git, encrypted) nor
@@ -356,7 +359,8 @@ anything outside Postgres.
 same node and the same disk. The PVC guards against a mistake or a corrupted
 database volume, not against hardware, and **not against a full disk**:
 `local-path` does not enforce the PVC's size, so dumps and `PGDATA` share the
-free space, and a disk filled by dumps stops Postgres. Check the free space of
+free space, and a disk filled by dumps stops Postgres (about 30 dumps at most
+with the retention above). Check the free space of
 `/var/lib/rancher/k3s/storage` on the node against (dumps you keep) x (size of
 one dump), prune, or put the PVC on other storage with a `storageClassName`. Copy dumps off the node regularly (below),
 and keep them out of git (they contain accounts).
@@ -365,8 +369,9 @@ The app's own `/admin/backup` JSON export is a separate, different thing: it
 holds only the quiz content (no games, no extra accounts) and is restored
 through the app, not with `pg_restore`. Both are useful.
 
-Settings: the schedule is `spec.schedule` and the warning level the
-`WARN_PERCENT` env var in `base/backup/cronjob.yaml`; the PVC size is in
+Settings: the schedule is `spec.schedule` and the warning level, retention
+days and minimum kept dumps the `WARN_PERCENT`, `RETENTION_DAYS` and `MIN_KEEP`
+env vars in `base/backup/cronjob.yaml`; the PVC size is in
 `pvc.yaml`. `overlays/production` patches the size (5Gi, a label on
 `local-path`) and has commented places for a schedule and a `storageClassName`.
 
@@ -390,7 +395,7 @@ kubectl -n $NS logs job/postgres-backup-manual-<...>   # "wrote ... (N bytes)" a
 
 ### Prune old dumps by hand
 
-Dumps pile up (about one per day). Use the throwaway pod from the next
+Old dumps go by themselves (above); to free space sooner, use the throwaway pod from the next
 section, but with `readOnly: false` on the volume mount, list the dumps and
 delete the old ones (keep the newest ones and at least one you have checked):
 
@@ -542,7 +547,7 @@ database, change the password with `ALTER USER` first.
 - **Running games across deploys:** each game is snapshotted to Postgres after every move, so a restart only interrupts players for a few seconds.
 - **TLS:** the local overlay uses plain http; `overlays/production` gets its certificate from cert-manager (see "Public deployment with Let's Encrypt") and runs in its own namespace.
 - **Registry:** the app repository's CI already pushes to GHCR (`sha-<7>` tags); `overlays/production` pulls from there, `overlays/local` still uses `ctr import`.
-- **Backups:** done: a daily `pg_dump` CronJob (dumps are never deleted automatically, pruning is by hand; the Discord notification is only a mock), see "Backups". It lands on the same node as the database; copying dumps off the node is still manual (an off-site copy, e.g. an object store, would be the next step).
+- **Backups:** done: a daily `pg_dump` CronJob (dumps older than 30 days are deleted, the newest 7 never; the Discord notification is only a mock), see "Backups". It lands on the same node as the database; copying dumps off the node is still manual (an off-site copy, e.g. an object store, would be the next step).
 - **Yu-Gi-Oh! extras:** a card image cache (PVC or object storage) and an EDOPro/ygopro-core engine container would be added here as extra resources.
 
 ## Reviewing pull requests

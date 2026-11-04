@@ -1,6 +1,7 @@
-# Daily pg_dump of the app database into the `postgres-backup` PVC. Nothing is
-# ever deleted here: a corrupt database can still be dumped, so a new dump must
-# not push out an older good one. Prune by hand (README "Backups").
+# Daily pg_dump of the app database into the `postgres-backup` PVC. Dumps older
+# than RETENTION_DAYS are deleted after a verified new dump, but the newest
+# MIN_KEEP are never deleted: a corrupt database can still be dumped, so a run
+# of bad dumps must not push out every older good one (README "Backups").
 # Restore: README "Backups".
 apiVersion: batch/v1
 kind: CronJob
@@ -9,7 +10,8 @@ metadata:
   labels:
     app.kubernetes.io/name: postgres-backup
 spec:
-  schedule: "17 3 * * *" # 03:17 UTC; overlays patch it
+  schedule: "17 3 * * *" # 03:17 in timeZone below; overlays patch it
+  timeZone: "Etc/UTC" # without it the node's zone applies (Kubernetes 1.27+)
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 3600
   successfulJobsHistoryLimit: 3
@@ -65,7 +67,14 @@ spec:
                   echo "wrote ${file} ($(stat -c %s "${file}") bytes)"
                   ls -l /backup
 
-                  # no automatic deletion; tell the owner when the volume fills up
+                  # retention: only after a verified dump, only dumps older than
+                  # RETENTION_DAYS, never the newest MIN_KEEP. Names sort by time.
+                  ls -1 /backup/"${PGDATABASE}"-*.dump | sort -r | tail -n +"$((MIN_KEEP + 1))" |
+                    while read -r old; do
+                      if [ -n "$(find "$old" -mtime +"$RETENTION_DAYS")" ]; then rm -v -- "$old"; fi
+                    done
+
+                  # tell the owner when the volume fills up
                   used=$(df --output=pcent /backup | tail -n 1 | tr -dc 0-9)
                   count=$(ls -1 /backup/"${PGDATABASE}"-*.dump | wc -l)
                   notify "ok, wrote $(basename "${file}"), ${count} dumps, volume ${used}% full"
@@ -87,6 +96,12 @@ spec:
                 # the notification warns when the backup volume is this full (%)
                 - name: WARN_PERCENT
                   value: "80"
+                # dumps older than this many days are deleted (one month) ...
+                - name: RETENTION_DAYS
+                  value: "30"
+                # ... but this many of the newest are always kept
+                - name: MIN_KEEP
+                  value: "7"
               volumeMounts:
                 - name: backup
                   mountPath: /backup
